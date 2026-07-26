@@ -25,6 +25,14 @@ from rsl_rl.utils import resolve_callable, resolve_obs_groups
 from .ppo import PPO
 
 
+def compute_amp_reward(predictions: torch.Tensor, coefficient: float) -> torch.Tensor:
+    """Compute the bounded least-squares GAN style reward."""
+    return coefficient * torch.clamp(
+        1.0 - 0.25 * torch.square(predictions - 1.0),
+        min=0.0,
+    )
+
+
 class AmpReplayBuffer:
     """Fixed-size replay buffer for policy AMP observations."""
 
@@ -95,6 +103,7 @@ class AMP(PPO):
         discriminator_gradient_penalty_scale: float = 5.0,
         discriminator_weight_decay_scale: float = 1.0e-4,
         amp_replay_buffer_size: int = 200_000,
+        amp_reward_coef: float = 1.0,
         task_reward_scale: float = 0.0,
         style_reward_scale: float = 1.0,
         **kwargs,
@@ -108,11 +117,13 @@ class AMP(PPO):
         self.discriminator_logit_regularization_scale = discriminator_logit_regularization_scale
         self.discriminator_gradient_penalty_scale = discriminator_gradient_penalty_scale
         self.discriminator_weight_decay_scale = discriminator_weight_decay_scale
+        self.amp_state_dim = amp_observation_dim
+        self.amp_reward_coef = amp_reward_coef
         self.task_reward_scale = task_reward_scale
         self.style_reward_scale = style_reward_scale
 
         self.discriminator = MLP(
-            amp_observation_dim,
+            2 * self.amp_state_dim,
             1,
             discriminator_hidden_dims,
             discriminator_activation,
@@ -121,17 +132,29 @@ class AMP(PPO):
             self.discriminator.parameters(),
             lr=discriminator_learning_rate,
         )
-        self.amp_normalizer = EmpiricalNormalization(amp_observation_dim).to(self.device)
+        # One shared scaler is updated from policy/replay/expert states and is
+        # applied independently to both sides of every transition.
+        self.amp_normalizer = EmpiricalNormalization(self.amp_state_dim).to(self.device)
         self.amp_replay_buffer = AmpReplayBuffer(
             amp_replay_buffer_size,
-            amp_observation_dim,
+            2 * self.amp_state_dim,
             self.device,
         )
-        self._rollout_amp_observations: list[torch.Tensor] = []
+        self._rollout_amp_transitions: list[torch.Tensor] = []
+        self._current_amp_observations: torch.Tensor | None = None
         self.style_rewards = torch.zeros(1, device=self.device)
 
     def _get_amp_observations(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[group] for group in self.amp_observation_groups], dim=-1)
+
+    def _normalize_amp_transitions(self, transitions: torch.Tensor) -> torch.Tensor:
+        state, next_state = transitions.split(self.amp_state_dim, dim=-1)
+        return torch.cat((self.amp_normalizer(state), self.amp_normalizer(next_state)), dim=-1)
+
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        """Record the pre-step AMP state before sampling an action."""
+        self._current_amp_observations = self._get_amp_observations(obs).detach()
+        return super().act(obs)
 
     def process_env_step(
         self,
@@ -140,11 +163,23 @@ class AMP(PPO):
         dones: torch.Tensor,
         extras: dict[str, torch.Tensor],
     ) -> None:
-        amp_observations = self._get_amp_observations(obs).detach()
-        self._rollout_amp_observations.append(amp_observations)
+        if self._current_amp_observations is None:
+            raise RuntimeError("AMP process_env_step must follow AMP.act")
+
+        next_amp_observations = self._get_amp_observations(obs).detach().clone()
+        terminal_amp_observations = extras.get("terminal_amp_observations")
+        if terminal_amp_observations is not None:
+            done_mask = dones.bool()
+            next_amp_observations[done_mask] = terminal_amp_observations.to(self.device)[done_mask]
+
+        amp_transitions = torch.cat(
+            (self._current_amp_observations, next_amp_observations),
+            dim=-1,
+        )
+        self._rollout_amp_transitions.append(amp_transitions)
         with torch.no_grad():
-            logits = self.discriminator(self.amp_normalizer(amp_observations))
-            self.style_rewards = F.softplus(logits).squeeze(-1)
+            predictions = self.discriminator(self._normalize_amp_transitions(amp_transitions))
+            self.style_rewards = compute_amp_reward(predictions, self.amp_reward_coef).squeeze(-1)
             combined_rewards = (
                 self.task_reward_scale * rewards
                 + self.style_reward_scale * self.style_rewards
@@ -152,12 +187,13 @@ class AMP(PPO):
         extras["amp_style_reward"] = self.style_rewards.mean()
         extras["amp_task_reward"] = rewards.mean()
         super().process_env_step(obs, combined_rewards, dones, extras)
+        self._current_amp_observations = None
 
     def update(self) -> dict[str, float]:
-        if not self._rollout_amp_observations:
-            raise RuntimeError("AMP update requires at least one rollout observation")
-        online = torch.cat(self._rollout_amp_observations, dim=0)
-        self._rollout_amp_observations.clear()
+        if not self._rollout_amp_transitions:
+            raise RuntimeError("AMP update requires at least one rollout transition")
+        online = torch.cat(self._rollout_amp_transitions, dim=0)
+        self._rollout_amp_transitions.clear()
 
         ppo_losses = super().update()
         discriminator_losses = self._update_discriminator(online)
@@ -185,18 +221,24 @@ class AMP(PPO):
             expert_samples = self.collect_reference_motions(self.discriminator_batch_size).to(self.device)
 
             with torch.no_grad():
-                self.amp_normalizer.update(
-                    torch.cat((policy_samples, replay_samples, expert_samples), dim=0)
+                states = torch.cat(
+                    (
+                        *policy_samples.split(self.amp_state_dim, dim=-1),
+                        *replay_samples.split(self.amp_state_dim, dim=-1),
+                        *expert_samples.split(self.amp_state_dim, dim=-1),
+                    ),
+                    dim=0,
                 )
-            policy_samples = self.amp_normalizer(policy_samples)
-            replay_samples = self.amp_normalizer(replay_samples)
-            expert_samples = self.amp_normalizer(expert_samples).requires_grad_(True)
+                self.amp_normalizer.update(states)
+            policy_samples = self._normalize_amp_transitions(policy_samples)
+            replay_samples = self._normalize_amp_transitions(replay_samples)
+            expert_samples = self._normalize_amp_transitions(expert_samples).requires_grad_(True)
 
-            policy_logits = self.discriminator(torch.cat((policy_samples, replay_samples), dim=0))
-            expert_logits = self.discriminator(expert_samples)
+            policy_predictions = self.discriminator(torch.cat((policy_samples, replay_samples), dim=0))
+            expert_predictions = self.discriminator(expert_samples)
             prediction_loss = 0.5 * (
-                F.binary_cross_entropy_with_logits(policy_logits, torch.zeros_like(policy_logits))
-                + F.binary_cross_entropy_with_logits(expert_logits, torch.ones_like(expert_logits))
+                F.mse_loss(policy_predictions, -torch.ones_like(policy_predictions))
+                + F.mse_loss(expert_predictions, torch.ones_like(expert_predictions))
             )
             loss = prediction_loss
 
@@ -204,9 +246,9 @@ class AMP(PPO):
             loss = loss + self.discriminator_logit_regularization_scale * last_linear.weight.square().sum()
 
             expert_gradient = torch.autograd.grad(
-                expert_logits,
+                expert_predictions,
                 expert_samples,
-                grad_outputs=torch.ones_like(expert_logits),
+                grad_outputs=torch.ones_like(expert_predictions),
                 create_graph=True,
                 retain_graph=True,
                 only_inputs=True,
