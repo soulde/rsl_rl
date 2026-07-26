@@ -265,6 +265,8 @@ class AMP(PPO):
 
         actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]).to(device)
         print(f"Actor Model: {actor}")
+        if cfg["algorithm"].pop("share_cnn_encoders", None):
+            cfg["critic"]["cnns"] = actor.cnns  # type: ignore
         critic = critic_class(obs, cfg["obs_groups"], "critic", 1, **cfg["critic"]).to(device)
         print(f"Critic Model: {critic}")
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
