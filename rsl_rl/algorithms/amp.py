@@ -54,6 +54,25 @@ class AmpReplayBuffer:
         indexes = torch.randint(self.size, (batch_size,), device=self.data.device)
         return self.data[indexes]
 
+    def state_dict(self) -> dict:
+        """Return only initialized replay data and cursor metadata."""
+        return {
+            "data": self.data[: self.size].clone(),
+            "size": self.size,
+            "position": self.position,
+        }
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore replay data into the configured local capacity."""
+        saved_data = state_dict["data"].to(self.data.device)
+        if saved_data.shape[0] > self.capacity:
+            saved_data = saved_data[-self.capacity :]
+        self.size = saved_data.shape[0]
+        self.data[: self.size].copy_(saved_data)
+        self.position = int(state_dict["position"]) % self.capacity
+        if self.size < self.capacity:
+            self.position = min(self.position, self.size)
+
 
 class AMP(PPO):
     """PPO with an AMP discriminator and style-reward mixing."""
@@ -239,6 +258,7 @@ class AMP(PPO):
                 "amp_discriminator_state_dict": self.discriminator.state_dict(),
                 "amp_discriminator_optimizer_state_dict": self.discriminator_optimizer.state_dict(),
                 "amp_normalizer_state_dict": self.amp_normalizer.state_dict(),
+                "amp_replay_buffer_state_dict": self.amp_replay_buffer.state_dict(),
             }
         )
         return saved_dict
@@ -249,6 +269,8 @@ class AMP(PPO):
             self.discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"], strict=strict)
             self.discriminator_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
             self.amp_normalizer.load_state_dict(loaded_dict["amp_normalizer_state_dict"], strict=strict)
+            if "amp_replay_buffer_state_dict" in loaded_dict:
+                self.amp_replay_buffer.load_state_dict(loaded_dict["amp_replay_buffer_state_dict"])
         return load_iteration
 
     @staticmethod
