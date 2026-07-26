@@ -71,6 +71,7 @@ class AMP(PPO):
         discriminator_learning_rate: float = 5.0e-4,
         discriminator_batch_size: int = 4096,
         discriminator_updates: int = 4,
+        discriminator_loss_scale: float = 5.0,
         discriminator_logit_regularization_scale: float = 0.05,
         discriminator_gradient_penalty_scale: float = 5.0,
         discriminator_weight_decay_scale: float = 1.0e-4,
@@ -84,6 +85,7 @@ class AMP(PPO):
         self.collect_reference_motions = collect_reference_motions
         self.discriminator_batch_size = discriminator_batch_size
         self.discriminator_updates = discriminator_updates
+        self.discriminator_loss_scale = discriminator_loss_scale
         self.discriminator_logit_regularization_scale = discriminator_logit_regularization_scale
         self.discriminator_gradient_penalty_scale = discriminator_gradient_penalty_scale
         self.discriminator_weight_decay_scale = discriminator_weight_decay_scale
@@ -201,6 +203,7 @@ class AMP(PPO):
                 ]
             )
             loss = loss + self.discriminator_weight_decay_scale * all_weights.square().sum()
+            loss = self.discriminator_loss_scale * loss
 
             self.discriminator_optimizer.zero_grad()
             loss.backward()
