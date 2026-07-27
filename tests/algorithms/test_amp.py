@@ -6,11 +6,11 @@ from rsl_rl.algorithms.amp import AmpReplayBuffer, compute_amp_reward
 def test_amp_reward_matches_lsgan_quadratic():
     predictions = torch.tensor([[-1.0], [0.0], [1.0], [3.0], [4.0]])
 
-    rewards = compute_amp_reward(predictions, coefficient=0.2)
+    rewards = compute_amp_reward(predictions)
 
     assert torch.allclose(
         rewards.squeeze(-1),
-        torch.tensor([0.0, 0.15, 0.2, 0.0, 0.0]),
+        torch.tensor([0.0, 0.75, 1.0, 0.0, 0.0]),
     )
 
 

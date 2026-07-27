@@ -25,9 +25,9 @@ from rsl_rl.utils import resolve_callable, resolve_obs_groups
 from .ppo import PPO
 
 
-def compute_amp_reward(predictions: torch.Tensor, coefficient: float) -> torch.Tensor:
+def compute_amp_reward(predictions: torch.Tensor) -> torch.Tensor:
     """Compute the bounded least-squares GAN style reward."""
-    return coefficient * torch.clamp(
+    return torch.clamp(
         1.0 - 0.25 * torch.square(predictions - 1.0),
         min=0.0,
     )
@@ -103,7 +103,6 @@ class AMP(PPO):
         discriminator_gradient_penalty_scale: float = 5.0,
         discriminator_weight_decay_scale: float = 1.0e-4,
         amp_replay_buffer_size: int = 200_000,
-        amp_reward_coef: float = 1.0,
         task_reward_scale: float = 0.0,
         style_reward_scale: float = 1.0,
         **kwargs,
@@ -118,7 +117,6 @@ class AMP(PPO):
         self.discriminator_gradient_penalty_scale = discriminator_gradient_penalty_scale
         self.discriminator_weight_decay_scale = discriminator_weight_decay_scale
         self.amp_state_dim = amp_observation_dim
-        self.amp_reward_coef = amp_reward_coef
         self.task_reward_scale = task_reward_scale
         self.style_reward_scale = style_reward_scale
 
@@ -179,7 +177,7 @@ class AMP(PPO):
         self._rollout_amp_transitions.append(amp_transitions)
         with torch.no_grad():
             predictions = self.discriminator(self._normalize_amp_transitions(amp_transitions))
-            self.style_rewards = compute_amp_reward(predictions, self.amp_reward_coef).squeeze(-1)
+            self.style_rewards = compute_amp_reward(predictions).squeeze(-1)
             combined_rewards = (
                 self.task_reward_scale * rewards
                 + self.style_reward_scale * self.style_rewards
