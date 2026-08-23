@@ -315,7 +315,10 @@ class AMP(PPO):
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "AMP":
-        """Construct AMP and connect it to the environment expert dataset."""
+        """Construct AMP and connect it to the motion dataset.
+
+        The motion dataset is loaded from the path specified in cfg["algorithm"]["motion_dir"].
+        """
         alg_class: type[AMP] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
         critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
@@ -335,7 +338,44 @@ class AMP(PPO):
 
         amp_groups = cfg["obs_groups"]["discriminator"]
         amp_dim = sum(obs[group].shape[-1] for group in amp_groups)
-        motion_dataset = env.unwrapped.motion_dataset
+
+        # Load motion dataset from config path
+        motion_dir = cfg["algorithm"].pop("motion_dir", None)
+        if motion_dir is None:
+            raise ValueError("AMP requires 'motion_dir' to be specified in algorithm config")
+
+        # Extract body configuration
+        key_body_names = cfg["algorithm"].pop("key_body_names", None)
+        body_names = cfg["algorithm"].pop("body_names", None)
+        motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
+
+        from rsl_rl.datasets import MotionDataset
+        motion_dataset = MotionDataset(
+            motion_dir=motion_dir,
+            device=device,
+            amp_observation_dim=amp_dim,
+            time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
+            key_body_names=key_body_names,
+            body_names=body_names,
+            motion_file_pattern=motion_file_pattern,
+        )
+
+        # Extract AMP-specific parameters from config
+        amp_params = {
+            "discriminator_hidden_dims": cfg["algorithm"].pop("discriminator_hidden_dims", (1024, 512)),
+            "discriminator_activation": cfg["algorithm"].pop("discriminator_activation", "relu"),
+            "discriminator_learning_rate": cfg["algorithm"].pop("discriminator_learning_rate", 5e-4),
+            "discriminator_batch_size": cfg["algorithm"].pop("discriminator_batch_size", 4096),
+            "discriminator_updates": cfg["algorithm"].pop("discriminator_updates", 4),
+            "discriminator_loss_scale": cfg["algorithm"].pop("discriminator_loss_scale", 5.0),
+            "discriminator_logit_regularization_scale": cfg["algorithm"].pop("discriminator_logit_regularization_scale", 0.05),
+            "discriminator_gradient_penalty_scale": cfg["algorithm"].pop("discriminator_gradient_penalty_scale", 5.0),
+            "discriminator_weight_decay_scale": cfg["algorithm"].pop("discriminator_weight_decay_scale", 1e-4),
+            "amp_replay_buffer_size": cfg["algorithm"].pop("amp_replay_buffer_size", 200000),
+            "task_reward_scale": cfg["algorithm"].pop("task_reward_scale", 0.0),
+            "style_reward_scale": cfg["algorithm"].pop("style_reward_scale", 1.0),
+        }
+
         return alg_class(
             actor,
             critic,
@@ -345,5 +385,6 @@ class AMP(PPO):
             collect_reference_motions=motion_dataset.sample_amp_observations,
             device=device,
             **cfg["algorithm"],
+            **amp_params,
             multi_gpu_cfg=cfg["multi_gpu"],
         )
