@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import pytest
 
-from rsl_rl.algorithms.amp import AmpReplayBuffer, compute_amp_reward
+from rsl_rl.algorithms.amp import AmpReplayBuffer, compute_amp_reward, valid_amp_transition_mask
 from rsl_rl.datasets import MotionDataset
 
 
@@ -75,8 +75,127 @@ def test_motion_dataset_filters_npz_basenames_with_regex(tmp_path, capsys):
     assert "Selected 1 of 2 NPZ files" in capsys.readouterr().out
 
 
+def test_motion_dataset_selects_one_file_per_motion_kind_with_regex(tmp_path, capsys):
+    payload = {
+        "fps": np.array([50]),
+        "joint_pos": np.zeros((2, 2), dtype=np.float32),
+        "joint_vel": np.zeros((2, 2), dtype=np.float32),
+        "body_pos_w": np.zeros((2, 1, 3), dtype=np.float32),
+        "body_quat_w": np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (2, 1, 1)),
+        "body_lin_vel_w": np.zeros((2, 1, 3), dtype=np.float32),
+        "body_ang_vel_w": np.zeros((2, 1, 3), dtype=np.float32),
+    }
+    np.savez(tmp_path / "walking_fast01_stageii.npz", **payload)
+    np.savez(tmp_path / "walking_fast07_stageii.npz", **payload)
+    np.savez(tmp_path / "4_WalkInClockwiseCircle03_stageii.npz", **payload)
+    np.savez(tmp_path / "7_WalkInClockwiseCircle10_stageii.npz", **payload)
+
+    dataset = MotionDataset(
+        str(tmp_path),
+        amp_observation_dim=17,
+        motion_file_pattern=r".*01_stageii\.npz",
+    )
+
+    assert len(dataset.motions) == 1
+    assert "Selected 1 of 4 NPZ files" in capsys.readouterr().out
+
+
+def test_motion_dataset_selects_explicit_file_list(tmp_path):
+    payload = {
+        "fps": np.array([50]),
+        "joint_pos": np.zeros((2, 2), dtype=np.float32),
+        "joint_vel": np.zeros((2, 2), dtype=np.float32),
+        "body_pos_w": np.zeros((2, 1, 3), dtype=np.float32),
+        "body_quat_w": np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (2, 1, 1)),
+        "body_lin_vel_w": np.zeros((2, 1, 3), dtype=np.float32),
+        "body_ang_vel_w": np.zeros((2, 1, 3), dtype=np.float32),
+    }
+    np.savez(tmp_path / "run01_stageii.npz", **payload)
+    np.savez(tmp_path / "turn_left01_stageii.npz", **payload)
+    np.savez(tmp_path / "debug.npz", **payload)
+
+    dataset = MotionDataset(
+        str(tmp_path),
+        amp_observation_dim=17,
+        motion_files=["turn_left01_stageii.npz", "run01_stageii.npz"],
+    )
+
+    assert len(dataset.motions) == 2
+
+
+def test_motion_dataset_rejects_unknown_explicit_files(tmp_path):
+    np.savez(tmp_path / "run01_stageii.npz", fps=np.array([50]))
+
+    with pytest.raises(ValueError, match="motion_files not found"):
+        MotionDataset(str(tmp_path), motion_files=["missing.npz"])
+
+
+def test_motion_dataset_rejects_pattern_and_list_together(tmp_path):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MotionDataset(
+            str(tmp_path),
+            motion_file_pattern=r".*\.npz",
+            motion_files=["run01_stageii.npz"],
+        )
+
+
 def test_motion_dataset_rejects_regex_without_matches(tmp_path):
     np.savez(tmp_path / "walking.npz", joint_pos=np.zeros((1, 1), dtype=np.float32))
 
     with pytest.raises(ValueError, match="matched no NPZ files"):
         MotionDataset(str(tmp_path), motion_file_pattern=r"run_.*\.npz")
+
+
+def test_motion_dataset_converts_key_bodies_to_root_frame_and_excludes_last_frame(tmp_path):
+    root_quat = np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=np.float32)
+    body_pos = np.array(
+        [
+            [[3.0, 4.0, 1.0], [4.0, 4.0, 1.0]],
+            [[3.0, 4.0, 1.0], [4.0, 4.0, 1.0]],
+            [[3.0, 4.0, 1.0], [4.0, 4.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+    np.savez(
+        tmp_path / "walk.npz",
+        fps=np.array([50]),
+        joint_pos=np.zeros((3, 1), dtype=np.float32),
+        joint_vel=np.zeros((3, 1), dtype=np.float32),
+        body_pos_w=body_pos,
+        body_quat_w=np.tile(root_quat, (3, 2, 1)),
+        body_lin_vel_w=np.zeros((3, 2, 3), dtype=np.float32),
+        body_ang_vel_w=np.zeros((3, 2, 3), dtype=np.float32),
+    )
+
+    dataset = MotionDataset(
+        str(tmp_path),
+        amp_observation_dim=17,
+        key_body_names=["foot"],
+        body_names=["base", "foot"],
+    )
+
+    assert len(dataset) == 2
+    observation = dataset._get_observation(dataset.motions[0], 0)
+    assert torch.allclose(observation[-3:], torch.tensor([0.0, -1.0, 0.0]), atol=1e-5)
+
+
+def test_motion_dataset_rejects_joint_contract_mismatch(tmp_path):
+    payload = {
+        "fps": np.array([50]),
+        "joint_pos": np.zeros((2, 2), dtype=np.float32),
+        "joint_vel": np.zeros((2, 2), dtype=np.float32),
+        "body_pos_w": np.zeros((2, 1, 3), dtype=np.float32),
+        "body_quat_w": np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (2, 1, 1)),
+        "body_lin_vel_w": np.zeros((2, 1, 3), dtype=np.float32),
+        "body_ang_vel_w": np.zeros((2, 1, 3), dtype=np.float32),
+    }
+    np.savez(tmp_path / "walk.npz", **payload)
+
+    with pytest.raises(ValueError, match="joint contract"):
+        MotionDataset(str(tmp_path), joint_names=["joint_a"])
+
+
+def test_amp_transition_mask_excludes_terminated_environments():
+    dones = torch.tensor([0, 1, 0, 1], dtype=torch.long)
+
+    assert torch.equal(valid_amp_transition_mask(dones), torch.tensor([True, False, True, False]))

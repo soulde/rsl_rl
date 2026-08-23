@@ -33,6 +33,11 @@ def compute_amp_reward(predictions: torch.Tensor) -> torch.Tensor:
     )
 
 
+def valid_amp_transition_mask(dones: torch.Tensor) -> torch.Tensor:
+    """Return environments whose post-step observation is not an automatic reset."""
+    return ~dones.bool()
+
+
 class AmpReplayBuffer:
     """Fixed-size replay buffer for policy AMP observations."""
 
@@ -174,10 +179,13 @@ class AMP(PPO):
             (self._current_amp_observations, next_amp_observations),
             dim=-1,
         )
-        self._rollout_amp_transitions.append(amp_transitions)
+        valid_mask = valid_amp_transition_mask(dones)
+        if valid_mask.any():
+            self._rollout_amp_transitions.append(amp_transitions[valid_mask])
         with torch.no_grad():
             predictions = self.discriminator(self._normalize_amp_transitions(amp_transitions))
             self.style_rewards = compute_amp_reward(predictions).squeeze(-1)
+            self.style_rewards = self.style_rewards.masked_fill(~valid_mask, 0.0)
             combined_rewards = (
                 self.task_reward_scale * rewards
                 + self.style_reward_scale * self.style_rewards
@@ -188,15 +196,14 @@ class AMP(PPO):
         self._current_amp_observations = None
 
     def update(self) -> dict[str, float]:
-        if not self._rollout_amp_transitions:
-            raise RuntimeError("AMP update requires at least one rollout transition")
-        online = torch.cat(self._rollout_amp_transitions, dim=0)
+        online = torch.cat(self._rollout_amp_transitions, dim=0) if self._rollout_amp_transitions else None
         self._rollout_amp_transitions.clear()
 
         ppo_losses = super().update()
-        discriminator_losses = self._update_discriminator(online)
-        self.amp_replay_buffer.add(online)
-        ppo_losses.update(discriminator_losses)
+        if online is not None:
+            discriminator_losses = self._update_discriminator(online)
+            self.amp_replay_buffer.add(online)
+            ppo_losses.update(discriminator_losses)
         return ppo_losses
 
     def _update_discriminator(self, online: torch.Tensor) -> dict[str, float]:
@@ -347,7 +354,9 @@ class AMP(PPO):
         # Extract body configuration
         key_body_names = cfg["algorithm"].pop("key_body_names", None)
         body_names = cfg["algorithm"].pop("body_names", None)
+        joint_names = cfg["algorithm"].pop("joint_names", None)
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
+        motion_files = cfg["algorithm"].pop("motion_files", None)
 
         from rsl_rl.datasets import MotionDataset
         motion_dataset = MotionDataset(
@@ -357,7 +366,9 @@ class AMP(PPO):
             time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
             key_body_names=key_body_names,
             body_names=body_names,
+            joint_names=joint_names,
             motion_file_pattern=motion_file_pattern,
+            motion_files=motion_files,
         )
 
         # Extract AMP-specific parameters from config

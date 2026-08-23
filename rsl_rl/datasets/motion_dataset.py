@@ -30,7 +30,9 @@ class MotionDataset:
         time_between_frames: float = 0.02,
         key_body_names: list[str] | None = None,
         body_names: list[str] | None = None,
+        joint_names: list[str] | None = None,
         motion_file_pattern: str | None = None,
+        motion_files: list[str] | None = None,
     ):
         """Initialize the motion dataset.
 
@@ -43,16 +45,34 @@ class MotionDataset:
                            If None, uses all bodies.
             body_names: List of body names in the NPZ file order.
                        Required if key_body_names is specified.
+            motion_file_pattern: Regex matched (fullmatch) against NPZ basenames to
+                                select a subset of files.
+            motion_files: Explicit list of NPZ basenames to load. Mutually
+                          exclusive with motion_file_pattern.
         """
         self.device = device
         self.amp_observation_dim = amp_observation_dim
         self.time_between_frames = time_between_frames
         self.key_body_names = key_body_names
+        self.joint_names = joint_names
 
         # Load all motion files (BeyondMimic format only)
         self.motions = []
         discovered_files = sorted(glob.glob(os.path.join(motion_dir, "*.npz")))
-        if motion_file_pattern is None:
+        if motion_file_pattern is not None and motion_files is not None:
+            raise ValueError("AMP motion_file_pattern and motion_files are mutually exclusive")
+        if motion_files is not None:
+            available = {os.path.basename(path) for path in discovered_files}
+            missing = sorted(set(motion_files) - available)
+            if missing:
+                raise ValueError(
+                    f"AMP motion_files not found in {motion_dir}: {missing}"
+                )
+            selected = {os.path.basename(path) for path in motion_files}
+            motion_files = [path for path in discovered_files if os.path.basename(path) in selected]
+            if len(motion_files) != len(selected):
+                raise ValueError("AMP motion_files contains duplicate entries")
+        elif motion_file_pattern is None:
             motion_files = discovered_files
         else:
             pattern = re.compile(motion_file_pattern)
@@ -82,6 +102,18 @@ class MotionDataset:
                 "body_lin_vel_w": torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device),
                 "body_ang_vel_w": torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device),
             }
+            if joint_names is not None:
+                if motion["joint_pos"].shape[-1] != len(joint_names):
+                    raise ValueError(
+                        f"AMP joint contract has {len(joint_names)} names but {motion['joint_pos'].shape[-1]} columns"
+                    )
+                if "joint_names" in data:
+                    source_joint_names = [str(name) for name in data["joint_names"].tolist()]
+                    if set(source_joint_names) != set(joint_names):
+                        raise ValueError("AMP joint contract names do not match motion joint names")
+                    reorder = [source_joint_names.index(name) for name in joint_names]
+                    motion["joint_pos"] = motion["joint_pos"][:, reorder]
+                    motion["joint_vel"] = motion["joint_vel"][:, reorder]
             # Read body_names if available in NPZ
             if "body_names" in data:
                 motion["body_names"] = list(data["body_names"])
@@ -120,7 +152,9 @@ class MotionDataset:
         self.frame_indices = []
         for motion_idx, motion in enumerate(self.motions):
             num_frames = motion["joint_pos"].shape[0]
-            for frame_idx in range(num_frames):
+            if num_frames < 2:
+                raise ValueError(f"AMP motion {motion_idx} must contain at least two frames")
+            for frame_idx in range(num_frames - 1):
                 self.frame_indices.append((motion_idx, frame_idx))
 
         # Validate observation dimension
@@ -189,7 +223,9 @@ class MotionDataset:
             key_body_pos = motion["body_pos_w"][frame_idx, self.key_body_indices, :]  # (K, 3)
         else:
             key_body_pos = motion["body_pos_w"][frame_idx]  # (B, 3) - all bodies
-        body_pos_relative = (key_body_pos - root_pos).flatten()  # (K*3,)
+        root_rotation = _quat_wxyz_to_matrix(motion["body_quat_w"][frame_idx, 0])
+        body_offsets = key_body_pos - root_pos
+        body_pos_relative = torch.matmul(root_rotation.transpose(-1, -2), body_offsets.T).T.flatten()
 
         root_orientation = _quat_wxyz_to_matrix(motion["body_quat_w"][frame_idx, 0])[:, :2].reshape(-1)
         base_lin_vel = motion["body_lin_vel_w"][frame_idx, 0]  # (3,)
