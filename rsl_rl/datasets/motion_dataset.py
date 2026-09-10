@@ -127,12 +127,21 @@ class MotionDataset:
         self.num_joints = self.motions[0]["joint_pos"].shape[-1]
         print(f"[AMP] Number of joints: {self.num_joints}")
 
-        # Get body names from config or motion file
-        if body_names is not None:
-            self.body_names = body_names
-        elif "body_names" in self.motions[0]:
+        # Get body names from config or motion file. An NPZ carrying its own
+        # body_names (e.g. soma-retargeter output with extra fixed links)
+        # describes its body axis order, so the file wins over the config:
+        # resolving key bodies against a mismatched name list would silently
+        # pick wrong indices.
+        if "body_names" in self.motions[0]:
             self.body_names = self.motions[0]["body_names"]
             print(f"[AMP] Body names loaded from motion file: {len(self.body_names)} bodies")
+            if body_names is not None and list(body_names) != list(self.body_names):
+                print(
+                    f"[AMP WARNING] config body_names ({len(body_names)}) differ from "
+                    f"motion file body_names ({len(self.body_names)}); using the file order"
+                )
+        elif body_names is not None:
+            self.body_names = body_names
         else:
             self.body_names = None
             if self.key_body_names is not None:
@@ -165,6 +174,15 @@ class MotionDataset:
             print(f"[AMP WARNING] amp_observation_dim={self.amp_observation_dim} != expected {expected_dim}")
             print(f"  joints={self.num_joints}, key_bodies={num_key_bodies}")
 
+        # Preload all expert transitions on the simulation device so that
+        # discriminator sampling is a single gather instead of a per-sample
+        # Python loop (which left the GPU idle for seconds per iteration).
+        observations = [self._all_observations(motion).to(device) for motion in self.motions]
+        self.transitions = torch.cat(
+            [torch.cat((obs[:-1], obs[1:]), dim=-1) for obs in observations]
+        )
+        print(f"[AMP] Preloaded {len(self.transitions)} expert transitions on {device}")
+
     def sample_amp_observations(self, batch_size: int) -> torch.Tensor:
         """Sample random AMP transitions from the motion dataset.
 
@@ -175,65 +193,41 @@ class MotionDataset:
             Tensor of shape (batch_size, 2 * amp_observation_dim) containing
             concatenated (state, next_state) transitions.
         """
-        # Sample random frame indices
-        indices = np.random.randint(0, len(self.frame_indices), size=batch_size)
-
-        transitions = []
-        for idx in indices:
-            motion_idx, frame_idx = self.frame_indices[idx]
-            motion = self.motions[motion_idx]
-
-            # Get current frame observation
-            state = self._get_observation(motion, frame_idx)
-
-            # Get next frame observation (with wrapping for episode boundaries)
-            next_frame_idx = (frame_idx + 1) % motion["joint_pos"].shape[0]
-            next_state = self._get_observation(motion, next_frame_idx)
-
-            # Concatenate state and next_state
-            transition = torch.cat([state, next_state])
-            transitions.append(transition)
-
-        return torch.stack(transitions)
+        if batch_size == 0:
+            return self.transitions[:0]
+        indices = torch.randint(0, len(self.transitions), (batch_size,), device=self.transitions.device)
+        return self.transitions[indices]
 
     def _get_observation(self, motion: dict, frame_idx: int) -> torch.Tensor:
-        """Extract AMP observation from a single frame.
+        """AMP observation of a single frame (compatibility wrapper)."""
+        return self._all_observations(motion)[frame_idx]
 
-        AMP observation contains:
-        - joint_pos: Joint positions (num_joints,)
-        - joint_vel: Joint velocities (num_joints,)
-        - body_pos_relative: Key body positions relative to root (K*3,)
-        - base_lin_vel: Base linear velocity (3,)
-        - base_ang_vel: Base angular velocity (3,)
-        - base_height: Base height in world frame (1,)
-
-        Args:
-            motion: Motion dictionary containing frame data.
-            frame_idx: Index of the frame.
-
-        Returns:
-            Tensor of shape (amp_observation_dim,) containing AMP observation.
-        """
-        joint_pos = motion["joint_pos"][frame_idx]  # (num_joints,)
-        joint_vel = motion["joint_vel"][frame_idx]  # (num_joints,)
-
-        # Compute key body positions relative to root (body 0)
-        root_pos = motion["body_pos_w"][frame_idx, 0:1, :]  # (1, 3)
+    def _all_observations(self, motion: dict) -> torch.Tensor:
+        """Vectorized AMP observations for every frame of one motion."""
+        joint_pos = motion["joint_pos"]
+        joint_vel = motion["joint_vel"]
+        root_pos = motion["body_pos_w"][:, 0:1, :]
         if self.key_body_indices is not None:
-            key_body_pos = motion["body_pos_w"][frame_idx, self.key_body_indices, :]  # (K, 3)
+            key_body_pos = motion["body_pos_w"][:, self.key_body_indices, :]
         else:
-            key_body_pos = motion["body_pos_w"][frame_idx]  # (B, 3) - all bodies
-        root_rotation = _quat_wxyz_to_matrix(motion["body_quat_w"][frame_idx, 0])
+            key_body_pos = motion["body_pos_w"]
+        root_rotation = _quat_wxyz_to_matrix_batch(motion["body_quat_w"][:, 0])
         body_offsets = key_body_pos - root_pos
-        body_pos_relative = torch.matmul(root_rotation.transpose(-1, -2), body_offsets.T).T.flatten()
-
-        root_orientation = _quat_wxyz_to_matrix(motion["body_quat_w"][frame_idx, 0])[:, :2].reshape(-1)
-        base_lin_vel = motion["body_lin_vel_w"][frame_idx, 0]  # (3,)
-        base_ang_vel = motion["body_ang_vel_w"][frame_idx, 0]  # (3,)
-        z_pos = motion["body_pos_w"][frame_idx, 0, 2:3]  # (1,) - z height of root
-
+        body_pos_relative = torch.matmul(
+            root_rotation.transpose(-1, -2), body_offsets.transpose(-1, -2)
+        ).transpose(-1, -2).flatten(start_dim=1)
+        root_orientation = root_rotation[..., :2, :].reshape(len(joint_pos), -1)
         return torch.cat(
-            [z_pos, root_orientation, base_lin_vel, base_ang_vel, joint_pos, joint_vel, body_pos_relative]
+            [
+                root_pos[:, 0, 2:3],
+                root_orientation,
+                motion["body_lin_vel_w"][:, 0],
+                motion["body_ang_vel_w"][:, 0],
+                joint_pos,
+                joint_vel,
+                body_pos_relative,
+            ],
+            dim=-1,
         )
 
     def __len__(self) -> int:
@@ -250,3 +244,17 @@ def _quat_wxyz_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
             2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
         )
     ).reshape(3, 3)
+
+
+def _quat_wxyz_to_matrix_batch(quaternion: torch.Tensor) -> torch.Tensor:
+    """Convert (N, 4) WXYZ quaternions to (N, 3, 3) rotation matrices."""
+    quaternion = quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(1.0e-8)
+    w, x, y, z = quaternion.unbind(-1)
+    return torch.stack(
+        (
+            1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
+        ),
+        dim=-1,
+    ).reshape(*quaternion.shape[:-1], 3, 3)

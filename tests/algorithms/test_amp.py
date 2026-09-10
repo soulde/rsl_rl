@@ -179,6 +179,40 @@ def test_motion_dataset_converts_key_bodies_to_root_frame_and_excludes_last_fram
     assert torch.allclose(observation[-3:], torch.tensor([0.0, -1.0, 0.0]), atol=1e-5)
 
 
+def test_motion_dataset_preloads_vectorized_transitions(tmp_path):
+    root_quat = np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=np.float32)
+    body_pos = np.random.default_rng(0).normal(size=(5, 2, 3)).astype(np.float32) + np.array([0.0, 0.0, 1.0])
+    body_quat = np.tile(root_quat, (5, 2, 1)).astype(np.float32)
+    np.savez(
+        tmp_path / "walk.npz",
+        fps=np.array([50]),
+        joint_pos=np.random.default_rng(1).normal(size=(5, 2)).astype(np.float32),
+        joint_vel=np.random.default_rng(2).normal(size=(5, 2)).astype(np.float32),
+        body_pos_w=body_pos,
+        body_quat_w=body_quat,
+        body_lin_vel_w=np.random.default_rng(3).normal(size=(5, 2, 3)).astype(np.float32),
+        body_ang_vel_w=np.random.default_rng(4).normal(size=(5, 2, 3)).astype(np.float32),
+    )
+
+    dataset = MotionDataset(
+        str(tmp_path),
+        amp_observation_dim=17,
+        key_body_names=["foot"],
+        body_names=["base", "foot"],
+    )
+
+    assert len(dataset.transitions) == len(dataset)
+    for frame_idx in range(len(dataset)):
+        expected = torch.cat(
+            [dataset._get_observation(dataset.motions[0], frame_idx),
+             dataset._get_observation(dataset.motions[0], frame_idx + 1)]
+        )
+        assert torch.allclose(dataset.transitions[frame_idx], expected, atol=1e-5)
+    sample = dataset.sample_amp_observations(64)
+    assert sample.shape == (64, 40)
+    assert sample.device == dataset.transitions.device
+
+
 def test_motion_dataset_rejects_joint_contract_mismatch(tmp_path):
     payload = {
         "fps": np.array([50]),
