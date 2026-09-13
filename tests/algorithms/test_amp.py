@@ -6,6 +6,12 @@ from rsl_rl.algorithms.amp import AmpReplayBuffer, compute_amp_reward, valid_amp
 from rsl_rl.datasets import MotionDataset
 
 
+def test_beyondmimic_motion_dataset_uses_shared_base():
+    from rsl_rl.datasets.base_motion_dataset import BaseMotionDataset
+
+    assert issubclass(MotionDataset, BaseMotionDataset)
+
+
 def test_amp_reward_matches_lsgan_quadratic():
     predictions = torch.tensor([[-1.0], [0.0], [1.0], [3.0], [4.0]])
 
