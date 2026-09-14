@@ -12,6 +12,95 @@ def test_beyondmimic_motion_dataset_uses_shared_base():
     assert issubclass(MotionDataset, BaseMotionDataset)
 
 
+SOMA_TEST_BODY_NAMES = [
+    "base_link", "waist_z_link", "waist_x_link", "body",
+    "left_shoulder_y_link", "left_shoulder_x_link", "left_shoulder_z_link", "left_elbow_link",
+    "left_wrist_z_link", "left_wrist_y_link", "left_wrist_x_link",
+    "right_shoulder_y_link", "right_shoulder_x_link", "right_shoulder_z_link", "right_elbow_link",
+    "right_wrist_z_link", "right_wrist_y_link", "right_wrist_x_link", "neck_link", "head_link",
+    "left_hip_y_link", "left_hip_x_link", "left_hip_z_link", "left_knee_link", "left_ankle_y_link",
+    "left_ankle_x_link", "left_toe_link", "right_hip_y_link", "right_hip_x_link", "right_hip_z_link",
+    "right_knee_link", "right_ankle_y_link", "right_ankle_x_link", "right_toe_link",
+]
+
+
+def _write_soma_npz(path, *, joint_names=None, body_names=None, frames=3):
+    joint_names = joint_names or ["joint_a", "joint_b"]
+    body_names = body_names or SOMA_TEST_BODY_NAMES
+    joint_pos = np.arange(frames * len(joint_names), dtype=np.float32).reshape(frames, len(joint_names))
+    body_pos = np.zeros((frames, len(body_names), 3), dtype=np.float32)
+    body_pos[:, body_names.index("left_ankle_x_link"), 0] = np.arange(frames, dtype=np.float32)
+    np.savez(
+        path,
+        fps=np.float32(50.0),
+        joint_pos=joint_pos,
+        joint_vel=joint_pos + 100.0,
+        body_pos_w=body_pos,
+        body_quat_w=np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (frames, len(body_names), 1)),
+        body_lin_vel_w=np.zeros_like(body_pos),
+        body_ang_vel_w=np.zeros_like(body_pos),
+        joint_names=np.asarray(joint_names),
+        body_names=np.asarray(body_names),
+    )
+
+
+def test_soma_motion_dataset_requires_embedded_name_contract(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    _write_soma_npz(tmp_path / "walk.npz")
+    with np.load(tmp_path / "walk.npz") as data:
+        payload = {key: data[key] for key in data.files if key not in {"joint_names", "body_names"}}
+    np.savez(tmp_path / "missing_names.npz", **payload)
+
+    with pytest.raises(ValueError, match="SOMA.*joint_names.*body_names"):
+        SomaMotionDataset(str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"])
+
+
+def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_frames(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    _write_soma_npz(tmp_path / "walk.npz")
+    dataset = SomaMotionDataset(
+        str(tmp_path),
+        amp_observation_dim=20,
+        key_body_names=["left_ankle_x_link"],
+        body_names=SOMA_TEST_BODY_NAMES,
+        joint_names=["joint_a", "joint_b"],
+    )
+
+    assert len(dataset) == 2
+    assert dataset.motions[0]["fps"] == 50.0
+    assert torch.equal(dataset.motions[0]["joint_pos"][:, 0], torch.tensor([0.0, 2.0, 4.0]))
+    assert torch.equal(dataset.motions[0]["joint_vel"][:, 1], torch.tensor([101.0, 103.0, 105.0]))
+    assert torch.equal(dataset.transitions[:, 13].sort().values, torch.tensor([0.0, 2.0]))
+
+
+def test_soma_motion_dataset_rejects_body_order_mismatch(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    swapped = list(SOMA_TEST_BODY_NAMES)
+    swapped[0], swapped[1] = swapped[1], swapped[0]
+    _write_soma_npz(tmp_path / "walk.npz", body_names=swapped)
+
+    with pytest.raises(ValueError, match="body_names"):
+        SomaMotionDataset(str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"])
+
+
+def test_amp_motion_dataset_format_selects_soma_and_defaults_to_beyondmimic():
+    from rsl_rl.algorithms.amp import resolve_motion_dataset_class
+    from rsl_rl.datasets import SomaMotionDataset
+
+    assert resolve_motion_dataset_class({}) is MotionDataset
+    assert resolve_motion_dataset_class({"motion_dataset_format": "soma"}) is SomaMotionDataset
+
+
+def test_amp_motion_dataset_format_rejects_unknown_format():
+    from rsl_rl.algorithms.amp import resolve_motion_dataset_class
+
+    with pytest.raises(ValueError, match="Unknown AMP motion dataset format"):
+        resolve_motion_dataset_class({"motion_dataset_format": "unknown"})
+
+
 def test_amp_reward_matches_lsgan_quadratic():
     predictions = torch.tensor([[-1.0], [0.0], [1.0], [3.0], [4.0]])
 

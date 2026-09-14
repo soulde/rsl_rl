@@ -38,6 +38,21 @@ def valid_amp_transition_mask(dones: torch.Tensor) -> torch.Tensor:
     return ~dones.bool()
 
 
+def resolve_motion_dataset_class(algorithm_cfg: dict):
+    """Resolve the configured AMP expert-motion dataset implementation."""
+    dataset_format = algorithm_cfg.get("motion_dataset_format", "beyondmimic")
+    from rsl_rl.datasets import MotionDataset, SomaMotionDataset
+
+    dataset_classes = {
+        "beyondmimic": MotionDataset,
+        "soma": SomaMotionDataset,
+    }
+    try:
+        return dataset_classes[dataset_format]
+    except KeyError as error:
+        raise ValueError(f"Unknown AMP motion dataset format: {dataset_format!r}") from error
+
+
 class AmpReplayBuffer:
     """Fixed-size replay buffer for policy AMP observations."""
 
@@ -358,8 +373,9 @@ class AMP(PPO):
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
         motion_files = cfg["algorithm"].pop("motion_files", None)
 
-        from rsl_rl.datasets import MotionDataset
-        motion_dataset = MotionDataset(
+        motion_dataset_class = resolve_motion_dataset_class(cfg["algorithm"])
+        cfg["algorithm"].pop("motion_dataset_format", None)
+        motion_dataset = motion_dataset_class(
             motion_dir=motion_dir,
             device=device,
             amp_observation_dim=amp_dim,

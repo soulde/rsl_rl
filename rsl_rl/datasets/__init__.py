@@ -5,6 +5,8 @@
 
 """Datasets for AMP training."""
 
+from .base_motion_dataset import BaseMotionDataset
 from .motion_dataset import MotionDataset
+from .soma_motion_dataset import SomaMotionDataset
 
-__all__ = ["MotionDataset"]
+__all__ = ["BaseMotionDataset", "MotionDataset", "SomaMotionDataset"]
