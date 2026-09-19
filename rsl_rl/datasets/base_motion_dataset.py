@@ -165,6 +165,7 @@ class BaseMotionDataset(ABC):
             key_body_pos = motion["body_pos_w"][:, self.key_body_indices, :]
         else:
             key_body_pos = motion["body_pos_w"]
+        # The retargeted NPZ motions store MuJoCo WXYZ quaternions.
         root_rotation = _quat_wxyz_to_matrix_batch(motion["body_quat_w"][:, 0])
         body_offsets = key_body_pos - root_pos
         body_pos_relative = torch.matmul(

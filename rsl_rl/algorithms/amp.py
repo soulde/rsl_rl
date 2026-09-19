@@ -121,7 +121,7 @@ class AMP(PPO):
         discriminator_loss_scale: float = 5.0,
         discriminator_logit_regularization_scale: float = 0.05,
         discriminator_gradient_penalty_scale: float = 5.0,
-        discriminator_weight_decay_scale: float = 1.0e-4,
+        discriminator_weight_decay_scale: float = 0.0,
         amp_replay_buffer_size: int = 200_000,
         task_reward_scale: float = 0.0,
         style_reward_scale: float = 1.0,
@@ -146,8 +146,24 @@ class AMP(PPO):
             discriminator_hidden_dims,
             discriminator_activation,
         ).to(self.device)
+        # Optimizer weight-decay groups follow the chocolate AMP setup:
+        # light decay on the trunk, heavy decay on the output head.
+        discriminator_parameters = list(self.discriminator.parameters())
+        head_linears = [module for module in self.discriminator.modules() if isinstance(module, nn.Linear)]
+        head_param_ids = {id(p) for module in head_linears[-1:] for p in module.parameters()}
         self.discriminator_optimizer = optim.Adam(
-            self.discriminator.parameters(),
+            [
+                {
+                    "params": [p for p in discriminator_parameters if id(p) not in head_param_ids],
+                    "weight_decay": 10.0e-4,
+                    "name": "amp_trunk",
+                },
+                {
+                    "params": [p for p in discriminator_parameters if id(p) in head_param_ids],
+                    "weight_decay": 10.0e-2,
+                    "name": "amp_head",
+                },
+            ],
             lr=discriminator_learning_rate,
         )
         # One shared scaler is updated from policy/replay/expert states and is
@@ -216,6 +232,11 @@ class AMP(PPO):
 
         ppo_losses = super().update()
         if online is not None:
+            # Chocolate trains the discriminator with the same KL-adaptive
+            # learning rate as the policy (shared optimizer); mirror that by
+            # syncing the discriminator lr to the post-update policy lr.
+            for param_group in self.discriminator_optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
             discriminator_losses = self._update_discriminator(online)
             self.amp_replay_buffer.add(online)
             ppo_losses.update(discriminator_losses)
@@ -275,15 +296,18 @@ class AMP(PPO):
             )[0]
             gradient_penalty = expert_gradient.square().sum(dim=-1).mean()
             loss = loss + self.discriminator_gradient_penalty_scale * gradient_penalty
-
-            all_weights = torch.cat(
-                [
-                    module.weight.flatten()
-                    for module in self.discriminator.modules()
-                    if isinstance(module, nn.Linear)
-                ]
-            )
-            loss = loss + self.discriminator_weight_decay_scale * all_weights.square().sum()
+            # Weight decay lives in the optimizer param groups (chocolate
+            # layout); the in-loss all-layer term stays available but
+            # defaults off.
+            if self.discriminator_weight_decay_scale:
+                all_weights = torch.cat(
+                    [
+                        module.weight.flatten()
+                        for module in self.discriminator.modules()
+                        if isinstance(module, nn.Linear)
+                    ]
+                )
+                loss = loss + self.discriminator_weight_decay_scale * all_weights.square().sum()
             loss = self.discriminator_loss_scale * loss
 
             self.discriminator_optimizer.zero_grad()
@@ -397,7 +421,7 @@ class AMP(PPO):
             "discriminator_loss_scale": cfg["algorithm"].pop("discriminator_loss_scale", 5.0),
             "discriminator_logit_regularization_scale": cfg["algorithm"].pop("discriminator_logit_regularization_scale", 0.05),
             "discriminator_gradient_penalty_scale": cfg["algorithm"].pop("discriminator_gradient_penalty_scale", 5.0),
-            "discriminator_weight_decay_scale": cfg["algorithm"].pop("discriminator_weight_decay_scale", 1e-4),
+            "discriminator_weight_decay_scale": cfg["algorithm"].pop("discriminator_weight_decay_scale", 0.0),
             "amp_replay_buffer_size": cfg["algorithm"].pop("amp_replay_buffer_size", 200000),
             "task_reward_scale": cfg["algorithm"].pop("task_reward_scale", 0.0),
             "style_reward_scale": cfg["algorithm"].pop("style_reward_scale", 1.0),
