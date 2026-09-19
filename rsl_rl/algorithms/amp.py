@@ -394,6 +394,7 @@ class AMP(PPO):
         key_body_names = cfg["algorithm"].pop("key_body_names", None)
         body_names = cfg["algorithm"].pop("body_names", None)
         joint_names = cfg["algorithm"].pop("joint_names", None)
+        quaternion_format = cfg["algorithm"].pop("motion_quaternion_format", "wxyz")
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
         motion_files = cfg["algorithm"].pop("motion_files", None)
 
@@ -407,6 +408,7 @@ class AMP(PPO):
             key_body_names=key_body_names,
             body_names=body_names,
             joint_names=joint_names,
+            quaternion_format=quaternion_format,
             motion_file_pattern=motion_file_pattern,
             motion_files=motion_files,
         )

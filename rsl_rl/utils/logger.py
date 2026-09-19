@@ -48,6 +48,8 @@ class Logger:
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.cur_episode_length = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.step_reward_sum = 0.0
+        self.step_reward_count = 0
 
         # Create RND buffers
         if self.cfg["algorithm"]["rnd_cfg"]:
@@ -116,6 +118,9 @@ class Logger:
             else:
                 self.cur_reward_sum += rewards
             self.cur_episode_length += 1
+            step_rewards = rewards if intrinsic_rewards is None else rewards + intrinsic_rewards
+            self.step_reward_sum += float(step_rewards.detach().sum().item())
+            self.step_reward_count += step_rewards.numel()
 
             # Clear data for completed episodes
             new_ids = (dones > 0).nonzero(as_tuple=False)
@@ -149,6 +154,7 @@ class Logger:
         If videos are available, they are uploaded to the logging service (W&B) as well.
         """
         if self.writer is not None:
+            mean_step_reward = None
             collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
             iteration_time = collect_time + learn_time
             self.tot_timesteps += collection_size
@@ -191,6 +197,12 @@ class Logger:
             self.writer.add_scalar("Perf/total_fps", fps, it)
             self.writer.add_scalar("Perf/collection_time", collect_time, it)
             self.writer.add_scalar("Perf/learning_time", learn_time, it)
+
+            if self.step_reward_count:
+                mean_step_reward = self.step_reward_sum / self.step_reward_count
+                self.writer.add_scalar("Train/mean_step_reward", mean_step_reward, it)
+                self.step_reward_sum = 0.0
+                self.step_reward_count = 0
 
             # Log rewards and episode length
             if len(self.rewbuffer) > 0:
@@ -235,6 +247,9 @@ class Logger:
                     log_string += f"""{"Mean intrinsic reward:":>{pad}} {statistics.mean(self.irewbuffer):.2f}\n"""
                 log_string += f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
                 log_string += f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
+
+            if mean_step_reward is not None:
+                log_string += f"""{"Mean step reward:":>{pad}} {mean_step_reward:.2f}\n"""
 
             # Print std
             log_string += f"""{"Mean action std:":>{pad}} {action_std.mean().item():.2f}\n"""

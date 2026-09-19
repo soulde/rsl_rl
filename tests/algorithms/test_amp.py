@@ -75,12 +75,63 @@ def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_fr
     assert torch.equal(dataset.transitions[:, 13].sort().values, torch.tensor([0.0, 2.0]))
 
 
-def test_soma_motion_dataset_rejects_body_order_mismatch(tmp_path):
+def test_motion_dataset_normalizes_body_order_and_quaternion_to_isaacsim(tmp_path):
     from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
 
-    swapped = list(SOMA_TEST_BODY_NAMES)
-    swapped[0], swapped[1] = swapped[1], swapped[0]
-    _write_soma_npz(tmp_path / "walk.npz", body_names=swapped)
+    source_body_names = list(reversed(SOMA_TEST_BODY_NAMES))
+    body_pos = np.zeros((3, len(source_body_names), 3), dtype=np.float32)
+    body_pos[:, source_body_names.index("left_ankle_x_link"), 0] = 2.0
+    _write_soma_npz(tmp_path / "walk.npz", body_names=source_body_names)
+    with np.load(tmp_path / "walk.npz") as data:
+        payload = {key: data[key] for key in data.files}
+    payload["body_pos_w"] = body_pos
+    # MuJoCo/GMR WXYZ (90 degrees around Z) must expose Isaac Sim XYZW.
+    payload["body_quat_w"] = np.tile(
+        np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=np.float32),
+        (3, len(source_body_names), 1),
+    )
+    np.savez(tmp_path / "walk.npz", **payload)
+
+    dataset = SomaMotionDataset(
+        str(tmp_path),
+        amp_observation_dim=20,
+        key_body_names=["left_ankle_x_link"],
+        body_names=SOMA_TEST_BODY_NAMES,
+        joint_names=["joint_a", "joint_b"],
+    )
+
+    motion = dataset.motions[0]
+    assert motion["body_names"] == SOMA_TEST_BODY_NAMES
+    assert torch.all(motion["body_pos_w"][:, SOMA_TEST_BODY_NAMES.index("left_ankle_x_link"), 0] == 2.0)
+    assert torch.allclose(
+        motion["body_quat_xyzw"][0, 0],
+        torch.tensor([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)], dtype=torch.float32),
+        atol=1e-6,
+    )
+
+
+def test_motion_dataset_accepts_xyzw_source_quaternions(tmp_path):
+    motion_path = tmp_path / "xyzw.npz"
+    np.savez(
+        motion_path,
+        fps=np.array([50]),
+        joint_pos=np.zeros((2, 1), dtype=np.float32),
+        joint_vel=np.zeros((2, 1), dtype=np.float32),
+        body_pos_w=np.zeros((2, 1, 3), dtype=np.float32),
+        body_quat_w=np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (2, 1, 1)),
+        body_lin_vel_w=np.zeros((2, 1, 3), dtype=np.float32),
+        body_ang_vel_w=np.zeros((2, 1, 3), dtype=np.float32),
+    )
+    dataset = MotionDataset(str(tmp_path), amp_observation_dim=15, quaternion_format="xyzw")
+    assert torch.allclose(dataset.motions[0]["body_quat_xyzw"][0, 0], torch.tensor([0.0, 0.0, 0.0, 1.0]))
+
+
+def test_soma_motion_dataset_rejects_body_name_mismatch(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    mismatched = list(SOMA_TEST_BODY_NAMES)
+    mismatched[0] = "not_a_robot_body"
+    _write_soma_npz(tmp_path / "walk.npz", body_names=mismatched)
 
     with pytest.raises(ValueError, match="body_names"):
         SomaMotionDataset(str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"])

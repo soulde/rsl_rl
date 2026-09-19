@@ -23,6 +23,7 @@ class BaseMotionDataset(ABC):
         key_body_names: list[str] | None = None,
         body_names: list[str] | None = None,
         joint_names: list[str] | None = None,
+        quaternion_format: str = "wxyz",
         motion_file_pattern: str | None = None,
         motion_files: list[str] | None = None,
     ):
@@ -31,6 +32,9 @@ class BaseMotionDataset(ABC):
         self.time_between_frames = time_between_frames
         self.key_body_names = key_body_names
         self.joint_names = joint_names
+        self.quaternion_format = quaternion_format.lower()
+        if self.quaternion_format not in {"wxyz", "xyzw"}:
+            raise ValueError("quaternion_format must be 'wxyz' or 'xyzw'")
 
         self.motions = []
         discovered_count = len(glob.glob(os.path.join(motion_dir, "*.npz")))
@@ -41,6 +45,7 @@ class BaseMotionDataset(ABC):
             if motion is None:
                 continue
             self._normalize_joint_contract(motion, joint_names)
+            self._normalize_body_contract(motion, body_names)
             self.motions.append(motion)
             print(f"[AMP] Loaded: {motion_file}")
 
@@ -115,13 +120,18 @@ class BaseMotionDataset(ABC):
         """Load one format-specific motion record."""
 
     @staticmethod
-    def _tensor_motion(data, device):
+    def _tensor_motion(data, device, quaternion_format):
+        body_quat = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
+        body_quat_xyzw = body_quat if quaternion_format == "xyzw" else body_quat[..., [1, 2, 3, 0]]
         motion = {
             "fps": float(np.asarray(data["fps"]).reshape(-1)[0]),
             "joint_pos": torch.tensor(data["joint_pos"], dtype=torch.float32, device=device),
             "joint_vel": torch.tensor(data["joint_vel"], dtype=torch.float32, device=device),
             "body_pos_w": torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device),
-            "body_quat_w": torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device),
+            # Keep the source field for compatibility and expose the Isaac
+            # Sim XYZW contract explicitly for consumers that need quaternions.
+            "body_quat_w": body_quat,
+            "body_quat_xyzw": body_quat_xyzw,
             "body_lin_vel_w": torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device),
             "body_ang_vel_w": torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device),
         }
@@ -129,6 +139,22 @@ class BaseMotionDataset(ABC):
             if key in data:
                 motion[key] = [str(name) for name in np.asarray(data[key]).tolist()]
         return motion
+
+    @staticmethod
+    def _normalize_body_contract(motion, body_names):
+        source_body_names = motion.get("body_names")
+        if source_body_names is None:
+            if body_names is not None:
+                motion["body_names"] = list(body_names)
+            return
+        if body_names is None:
+            return
+        if len(source_body_names) != len(body_names) or set(source_body_names) != set(body_names):
+            raise ValueError("AMP body contract names do not match motion body names")
+        reorder = [source_body_names.index(name) for name in body_names]
+        for key in ("body_pos_w", "body_quat_w", "body_quat_xyzw", "body_lin_vel_w", "body_ang_vel_w"):
+            motion[key] = motion[key][:, reorder]
+        motion["body_names"] = list(body_names)
 
     @staticmethod
     def _normalize_joint_contract(motion, joint_names):
@@ -165,8 +191,9 @@ class BaseMotionDataset(ABC):
             key_body_pos = motion["body_pos_w"][:, self.key_body_indices, :]
         else:
             key_body_pos = motion["body_pos_w"]
-        # The retargeted NPZ motions store MuJoCo WXYZ quaternions.
-        root_rotation = _quat_wxyz_to_matrix_batch(motion["body_quat_w"][:, 0])
+        # Isaac Sim AMP observations use rotation matrices; the source
+        # quaternions have already been normalized to the explicit XYZW field.
+        root_rotation = _quat_xyzw_to_matrix_batch(motion["body_quat_xyzw"][:, 0])
         body_offsets = key_body_pos - root_pos
         body_pos_relative = torch.matmul(
             root_rotation.transpose(-1, -2), body_offsets.transpose(-1, -2)
@@ -189,9 +216,9 @@ class BaseMotionDataset(ABC):
         return len(self.frame_indices)
 
 
-def _quat_wxyz_to_matrix_batch(quaternion: torch.Tensor) -> torch.Tensor:
+def _quat_xyzw_to_matrix_batch(quaternion: torch.Tensor) -> torch.Tensor:
     quaternion = quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(1.0e-8)
-    w, x, y, z = quaternion.unbind(-1)
+    x, y, z, w = quaternion.unbind(-1)
     return torch.stack(
         (
             1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),

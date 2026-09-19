@@ -18,4 +18,4 @@ class MotionDataset(BaseMotionDataset):
         if self.key_body_names is not None and body_names is None and "body_names" not in data:
             print(f"[AMP] Skipping {motion_file} (no body_names, required for key_body_names)")
             return None
-        return self._tensor_motion(data, self.device)
+        return self._tensor_motion(data, self.device, self.quaternion_format)

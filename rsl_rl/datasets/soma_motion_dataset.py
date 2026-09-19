@@ -38,10 +38,8 @@ class SomaMotionDataset(BaseMotionDataset):
             raise ValueError(f"SOMA motion {motion_file} has duplicate joint_names")
         if len(source_body_names) != len(set(source_body_names)):
             raise ValueError(f"SOMA motion {motion_file} has duplicate body_names")
-        if list(body_names) != source_body_names:
-            raise ValueError(
-                f"SOMA motion {motion_file} body_names do not match configured body_names"
-            )
+        if set(body_names) != set(source_body_names) or len(body_names) != len(source_body_names):
+            raise ValueError(f"SOMA motion {motion_file} body_names do not match configured body_names")
 
-        motion = self._tensor_motion(data, self.device)
+        motion = self._tensor_motion(data, self.device, self.quaternion_format)
         return motion
