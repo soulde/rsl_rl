@@ -5,3 +5,7 @@ Storage
    :members:
    :undoc-members:
 
+
+.. automodule:: rsl_rl.storage.dagger_storage
+   :members:
+   :undoc-members:
