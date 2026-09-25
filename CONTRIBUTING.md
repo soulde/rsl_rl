@@ -21,3 +21,18 @@ pre-commit run --all-files
 ```
 
 5. Open a pull request to the main branch.
+
+## Repository Git Flow
+
+The `develop` branch is the integration branch. Create short-lived branches
+from `develop` using `feat/<kebab-case>`, `fix/<kebab-case>`, or
+`chore/<kebab-case>` names. Keep `main` release-ready. Commit messages and
+pull request titles use Conventional Commits:
+
+```text
+<type>(<scope>): <imperative subject>
+```
+
+Use an English, lowercase subject of no more than 50 characters. Required
+checks and at least one non-author approval must pass before squash-merging a
+pull request into `develop`.
