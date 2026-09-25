@@ -16,3 +16,10 @@ Distillation Runner
    :members:
    :undoc-members:
 
+
+DAgger Runner
+-------------
+
+.. automodule:: rsl_rl.runners.dagger_runner
+   :members:
+   :undoc-members:
