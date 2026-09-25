@@ -24,3 +24,18 @@ CNN Model
    :members:
    :undoc-members:
 
+
+Conditional VAE
+---------------
+
+.. automodule:: rsl_rl.models.vae
+   :members:
+   :undoc-members:
+
+
+Conditional Diffusion
+---------------------
+
+.. automodule:: rsl_rl.models.diffusion
+   :members:
+   :undoc-members:
