@@ -19,6 +19,7 @@ class BaseMotionDataset(ABC):
         motion_dir: str,
         device: str = "cpu",
         amp_observation_dim: int = 190,
+        include_root_height: bool = True,
         time_between_frames: float = 0.02,
         key_body_names: list[str] | None = None,
         body_names: list[str] | None = None,
@@ -29,6 +30,7 @@ class BaseMotionDataset(ABC):
     ):
         self.device = device
         self.amp_observation_dim = amp_observation_dim
+        self.include_root_height = include_root_height
         self.time_between_frames = time_between_frames
         self.key_body_names = key_body_names
         self.joint_names = joint_names
@@ -83,7 +85,7 @@ class BaseMotionDataset(ABC):
 
         num_bodies = self.motions[0]["body_pos_w"].shape[1]
         num_key_bodies = len(self.key_body_indices) if self.key_body_indices is not None else num_bodies
-        expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 13
+        expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 12 + int(self.include_root_height)
         if self.amp_observation_dim != expected_dim:
             print(f"[AMP WARNING] amp_observation_dim={amp_observation_dim} != expected {expected_dim}")
             print(f"  joints={self.num_joints}, key_bodies={num_key_bodies}")
@@ -201,7 +203,7 @@ class BaseMotionDataset(ABC):
         root_orientation = root_rotation[..., :2, :].reshape(len(joint_pos), -1)
         return torch.cat(
             [
-                root_pos[:, 0, 2:3],
+                *([root_pos[:, 0, 2:3]] if self.include_root_height else []),
                 root_orientation,
                 motion["body_lin_vel_w"][:, 0],
                 motion["body_ang_vel_w"][:, 0],
