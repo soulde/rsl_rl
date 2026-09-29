@@ -202,6 +202,17 @@ class AMP(PPO):
 
         next_amp_observations = self._get_amp_observations(obs).detach().clone()
         terminal_amp_observations = extras.get("terminal_amp_observations")
+        if terminal_amp_observations is None:
+            # Isaac Lab exposes the pre-reset observation as ``final_obs``
+            # when compute_final_obs is enabled.  Convert it to the AMP
+            # observation contract before the environment's autoreset state
+            # is used, matching Chocolate's terminal AMP handling.
+            final_obs = extras.get("final_obs")
+            if final_obs is not None:
+                terminal_amp_observations = torch.cat(
+                    [final_obs[group] for group in self.amp_observation_groups],
+                    dim=-1,
+                )
         if terminal_amp_observations is not None:
             done_mask = dones.bool()
             next_amp_observations[done_mask] = terminal_amp_observations.to(self.device)[done_mask]
@@ -211,6 +222,10 @@ class AMP(PPO):
             dim=-1,
         )
         valid_mask = valid_amp_transition_mask(dones)
+        if terminal_amp_observations is not None:
+            # The pre-reset observation makes terminal transitions valid,
+            # so reward and train on them as Chocolate AMP does.
+            valid_mask = torch.ones_like(valid_mask)
         if valid_mask.any():
             self._rollout_amp_transitions.append(amp_transitions[valid_mask])
         with torch.no_grad():
@@ -394,6 +409,7 @@ class AMP(PPO):
         key_body_names = cfg["algorithm"].pop("key_body_names", None)
         body_names = cfg["algorithm"].pop("body_names", None)
         joint_names = cfg["algorithm"].pop("joint_names", None)
+        include_root_height = cfg["algorithm"].pop("amp_include_root_height", True)
         quaternion_format = cfg["algorithm"].pop("motion_quaternion_format", "wxyz")
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
         motion_files = cfg["algorithm"].pop("motion_files", None)
@@ -404,6 +420,7 @@ class AMP(PPO):
             motion_dir=motion_dir,
             device=device,
             amp_observation_dim=amp_dim,
+            include_root_height=include_root_height,
             time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
             key_body_names=key_body_names,
             body_names=body_names,
