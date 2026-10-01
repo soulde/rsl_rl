@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import glob
+import numpy as np
 import os
 import re
-from abc import ABC, abstractmethod
-
-import numpy as np
 import torch
+from abc import ABC, abstractmethod
 
 
 class BaseMotionDataset(ABC):
@@ -20,6 +19,7 @@ class BaseMotionDataset(ABC):
         device: str = "cpu",
         amp_observation_dim: int = 190,
         include_root_height: bool = True,
+        observation_profile: str = "default",
         time_between_frames: float = 0.02,
         key_body_names: list[str] | None = None,
         body_names: list[str] | None = None,
@@ -31,6 +31,9 @@ class BaseMotionDataset(ABC):
         self.device = device
         self.amp_observation_dim = amp_observation_dim
         self.include_root_height = include_root_height
+        self.observation_profile = observation_profile.lower()
+        if self.observation_profile not in {"default", "chocolate"}:
+            raise ValueError(f"Unknown AMP observation profile: {observation_profile!r}")
         self.time_between_frames = time_between_frames
         self.key_body_names = key_body_names
         self.joint_names = joint_names
@@ -39,6 +42,7 @@ class BaseMotionDataset(ABC):
             raise ValueError("quaternion_format must be 'wxyz' or 'xyzw'")
 
         self.motions = []
+        canonical_body_names = list(body_names) if body_names is not None else None
         discovered_count = len(glob.glob(os.path.join(motion_dir, "*.npz")))
         selected_files = self._select_motion_files(motion_dir, motion_file_pattern, motion_files)
         print(f"[AMP] Selected {len(selected_files)} of {discovered_count} NPZ files in {motion_dir}")
@@ -47,7 +51,11 @@ class BaseMotionDataset(ABC):
             if motion is None:
                 continue
             self._normalize_joint_contract(motion, joint_names)
-            self._normalize_body_contract(motion, body_names)
+            if canonical_body_names is None:
+                embedded_names = motion.get("body_names")
+                if embedded_names is not None:
+                    canonical_body_names = list(embedded_names)
+            self._normalize_body_contract(motion, canonical_body_names)
             self.motions.append(motion)
             print(f"[AMP] Loaded: {motion_file}")
 
@@ -72,8 +80,13 @@ class BaseMotionDataset(ABC):
 
         self.key_body_indices = None
         if self.key_body_names is not None and self.body_names is not None:
+            missing_key_bodies = [name for name in self.key_body_names if name not in self.body_names]
+            if missing_key_bodies:
+                raise ValueError(f"AMP key bodies are missing from motion body_names: {missing_key_bodies}")
             self.key_body_indices = [self.body_names.index(name) for name in self.key_body_names]
             print(f"[AMP] Key body indices: {self.key_body_indices}")
+        elif self.observation_profile == "chocolate":
+            raise ValueError("The chocolate AMP observation profile requires key_body_names and motion body_names")
 
         self.frame_indices = []
         for motion_idx, motion in enumerate(self.motions):
@@ -85,13 +98,24 @@ class BaseMotionDataset(ABC):
 
         num_bodies = self.motions[0]["body_pos_w"].shape[1]
         num_key_bodies = len(self.key_body_indices) if self.key_body_indices is not None else num_bodies
-        expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 12 + int(self.include_root_height)
+        if self.observation_profile == "chocolate":
+            expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 6
+        else:
+            expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 12 + int(self.include_root_height)
         if self.amp_observation_dim != expected_dim:
+            if self.observation_profile == "chocolate":
+                raise ValueError(
+                    f"Chocolate AMP observation dimension is {self.amp_observation_dim}, "
+                    f"but motion features require {expected_dim}"
+                )
             print(f"[AMP WARNING] amp_observation_dim={amp_observation_dim} != expected {expected_dim}")
             print(f"  joints={self.num_joints}, key_bodies={num_key_bodies}")
 
         observations = [self._all_observations(motion).to(device) for motion in self.motions]
         self.transitions = torch.cat([torch.cat((obs[:-1], obs[1:]), dim=-1) for obs in observations])
+        if self.transitions.shape[-1] % 2:
+            raise RuntimeError("AMP expert transitions must contain equally sized current and next observations")
+        self._motion_observation_dim = self.transitions.shape[-1] // 2
         print(f"[AMP] Preloaded {len(self.transitions)} expert transitions on {device}")
 
     @staticmethod
@@ -177,10 +201,72 @@ class BaseMotionDataset(ABC):
         motion["joint_vel"] = motion["joint_vel"][:, reorder]
 
     def sample_amp_observations(self, batch_size: int) -> torch.Tensor:
+        reference_frames = self.sample_reference_frames(batch_size)
+        return torch.cat((reference_frames["amp_obs"], reference_frames["amp_next_obs"]), dim=-1)
+
+    def sample_reference_frames(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Sample valid AMP transition frames and their aligned reset state.
+
+        Both expert transition sampling and RSI use this path, so motion/frame
+        selection, observation construction, and raw state decoding cannot drift.
+        The returned row order is the sampled transition order.
+        """
+        if batch_size < 0:
+            raise ValueError("AMP reference batch_size must be non-negative")
         if batch_size == 0:
-            return self.transitions[:0]
-        indices = torch.randint(0, len(self.transitions), (batch_size,), device=self.transitions.device)
-        return self.transitions[indices]
+            empty = self.transitions[:0]
+            amp_obs, amp_next_obs = empty.split((self._motion_observation_dim,) * 2, dim=-1)
+            return {
+                "amp_obs": amp_obs,
+                "amp_next_obs": amp_next_obs,
+                "joint_pos": self.motions[0]["joint_pos"][:0],
+                "joint_vel": self.motions[0]["joint_vel"][:0],
+                "root_pos": self.motions[0]["body_pos_w"][:0, 0],
+                "root_quat_xyzw": self.motions[0]["body_quat_xyzw"][:0, 0],
+                "root_lin_vel": self.motions[0]["body_lin_vel_w"][:0, 0],
+                "root_ang_vel": self.motions[0]["body_ang_vel_w"][:0, 0],
+            }
+
+        transition_ids = torch.randint(len(self.frame_indices), (batch_size,), device=self.transitions.device)
+        transitions = self.transitions[transition_ids]
+        amp_obs, amp_next_obs = transitions.split((self._motion_observation_dim,) * 2, dim=-1)
+        selected_frames = [self.frame_indices[index] for index in transition_ids.cpu().tolist()]
+
+        state_fields = {
+            "joint_pos": ("joint_pos", None),
+            "joint_vel": ("joint_vel", None),
+            "root_pos": ("body_pos_w", 0),
+            "root_quat_xyzw": ("body_quat_xyzw", 0),
+            "root_lin_vel": ("body_lin_vel_w", 0),
+            "root_ang_vel": ("body_ang_vel_w", 0),
+        }
+        sampled = {"amp_obs": amp_obs, "amp_next_obs": amp_next_obs}
+        for output_name, (motion_field, body_index) in state_fields.items():
+            shape = self.motions[0][motion_field].shape[1:]
+            if body_index is not None:
+                shape = shape[1:]
+            sampled[output_name] = torch.empty(
+                (batch_size, *shape), dtype=self.motions[0][motion_field].dtype, device=self.transitions.device
+            )
+
+        grouped_frames: dict[int, list[tuple[int, int]]] = {}
+        for output_index, (motion_index, frame_index) in enumerate(selected_frames):
+            grouped_frames.setdefault(motion_index, []).append((output_index, frame_index))
+        for motion_index, frame_pairs in grouped_frames.items():
+            motion = self.motions[motion_index]
+            output_ids = torch.tensor([pair[0] for pair in frame_pairs], device=self.transitions.device)
+            frame_ids = torch.tensor([pair[1] for pair in frame_pairs], device=self.transitions.device)
+            for output_name, (motion_field, body_index) in state_fields.items():
+                source = motion[motion_field][frame_ids]
+                if body_index is not None:
+                    source = source[:, body_index]
+                if output_name == "root_pos":
+                    # Place each clip's horizontal trajectory around the
+                    # selected environment origin while retaining source height.
+                    source = source.clone()
+                    source[:, :2] -= motion[motion_field][0, body_index, :2]
+                sampled[output_name][output_ids] = source
+        return sampled
 
     def _get_observation(self, motion, frame_idx):
         return self._all_observations(motion)[frame_idx]
@@ -200,6 +286,19 @@ class BaseMotionDataset(ABC):
         body_pos_relative = torch.matmul(
             root_rotation.transpose(-1, -2), body_offsets.transpose(-1, -2)
         ).transpose(-1, -2).flatten(start_dim=1)
+        if self.observation_profile == "chocolate":
+            root_lin_vel_local = torch.matmul(root_rotation.transpose(-1, -2), motion["body_lin_vel_w"][:, 0, :, None])
+            root_ang_vel_local = torch.matmul(root_rotation.transpose(-1, -2), motion["body_ang_vel_w"][:, 0, :, None])
+            return torch.cat(
+                [
+                    joint_pos,
+                    body_pos_relative,
+                    root_lin_vel_local.squeeze(-1),
+                    root_ang_vel_local.squeeze(-1),
+                    joint_vel,
+                ],
+                dim=-1,
+            )
         root_orientation = root_rotation[..., :2, :].reshape(len(joint_pos), -1)
         return torch.cat(
             [

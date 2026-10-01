@@ -23,8 +23,6 @@ class SomaMotionDataset(BaseMotionDataset):
     )
 
     def _load_motion_file(self, motion_file, *, body_names, joint_names):
-        if body_names is None:
-            raise ValueError(f"SOMA motion {motion_file} requires configured body_names")
         data = np.load(motion_file, allow_pickle=True)
         missing = [name for name in self._REQUIRED_FIELDS if name not in data]
         if missing:
@@ -38,7 +36,9 @@ class SomaMotionDataset(BaseMotionDataset):
             raise ValueError(f"SOMA motion {motion_file} has duplicate joint_names")
         if len(source_body_names) != len(set(source_body_names)):
             raise ValueError(f"SOMA motion {motion_file} has duplicate body_names")
-        if set(body_names) != set(source_body_names) or len(body_names) != len(source_body_names):
+        if body_names is not None and (
+            set(body_names) != set(source_body_names) or len(body_names) != len(source_body_names)
+        ):
             raise ValueError(f"SOMA motion {motion_file} body_names do not match configured body_names")
 
         motion = self._tensor_motion(data, self.device, self.quaternion_format)
