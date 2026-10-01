@@ -39,6 +39,16 @@ class OnPolicyRunner:
         alg_class: type[PPO] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
         self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
 
+        if getattr(self.alg, "reference_state_initialization", False):
+            sample_rsi = getattr(self.alg, "sample_rsi", None)
+            if not callable(sample_rsi):
+                raise RuntimeError("Reference-state initialization is enabled but the algorithm has no sample_rsi API")
+            self.env.unwrapped._amp_rsi_sampler = sample_rsi
+            # The environment creates an initial observation before the agent
+            # exists. Reset after registering the sampler so the first rollout
+            # also starts from a reference motion.
+            self.env.reset()
+
         # Create the logger
         self.logger = Logger(
             log_dir=log_dir,

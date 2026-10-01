@@ -358,6 +358,17 @@ def test_motion_dataset_preloads_vectorized_transitions(tmp_path):
     assert sample.shape == (64, 40)
     assert sample.device == dataset.transitions.device
 
+    reference = dataset.sample_reference_frames(64)
+    assert reference["amp_obs"].shape == (64, 20)
+    assert reference["amp_next_obs"].shape == (64, 20)
+    assert reference["joint_pos"].shape == (64, 2)
+    assert reference["root_pos"].shape == (64, 3)
+
+    empty_reference = dataset.sample_reference_frames(0)
+    assert empty_reference["amp_obs"].shape == (0, 20)
+    assert empty_reference["amp_next_obs"].shape == (0, 20)
+    assert empty_reference["joint_pos"].shape == (0, 2)
+
 
 def test_motion_dataset_rejects_joint_contract_mismatch(tmp_path):
     payload = {

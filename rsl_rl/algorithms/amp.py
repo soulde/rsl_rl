@@ -7,18 +7,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from collections.abc import Callable
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
-from rsl_rl.modules import EmpiricalNormalization, MLP
+from rsl_rl.modules import MLP, EmpiricalNormalization
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups
 
@@ -113,6 +112,8 @@ class AMP(PPO):
         amp_observation_groups: list[str],
         amp_observation_dim: int,
         collect_reference_motions: Callable[[int], torch.Tensor],
+        reference_frame_sampler: Callable[[int], dict[str, torch.Tensor]] | None = None,
+        reference_state_initialization: bool = False,
         discriminator_hidden_dims: tuple[int, ...] | list[int] = (1024, 512),
         discriminator_activation: str = "relu",
         discriminator_learning_rate: float = 5.0e-4,
@@ -130,6 +131,8 @@ class AMP(PPO):
         super().__init__(actor, critic, storage, **kwargs)
         self.amp_observation_groups = amp_observation_groups
         self.collect_reference_motions = collect_reference_motions
+        self._reference_frame_sampler = reference_frame_sampler
+        self.reference_state_initialization = reference_state_initialization
         self.discriminator_batch_size = discriminator_batch_size
         self.discriminator_updates = discriminator_updates
         self.discriminator_loss_scale = discriminator_loss_scale
@@ -180,6 +183,14 @@ class AMP(PPO):
 
     def _get_amp_observations(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[group] for group in self.amp_observation_groups], dim=-1)
+
+    def sample_rsi(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Sample reference states through the expert dataset's shared frame sampler."""
+        if self._reference_frame_sampler is None:
+            raise RuntimeError("AMP RSI requested, but no reference-frame sampler was configured")
+        if env_ids.ndim != 1:
+            raise ValueError(f"AMP RSI env_ids must be one-dimensional, got shape {tuple(env_ids.shape)}")
+        return self._reference_frame_sampler(int(env_ids.numel()))
 
     def _normalize_amp_transitions(self, transitions: torch.Tensor) -> torch.Tensor:
         state, next_state = transitions.split(self.amp_state_dim, dim=-1)
@@ -410,6 +421,7 @@ class AMP(PPO):
         body_names = cfg["algorithm"].pop("body_names", None)
         joint_names = cfg["algorithm"].pop("joint_names", None)
         include_root_height = cfg["algorithm"].pop("amp_include_root_height", True)
+        observation_profile = cfg["algorithm"].pop("observation_profile", "default")
         quaternion_format = cfg["algorithm"].pop("motion_quaternion_format", "wxyz")
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
         motion_files = cfg["algorithm"].pop("motion_files", None)
@@ -421,6 +433,7 @@ class AMP(PPO):
             device=device,
             amp_observation_dim=amp_dim,
             include_root_height=include_root_height,
+            observation_profile=observation_profile,
             time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
             key_body_names=key_body_names,
             body_names=body_names,
@@ -438,10 +451,13 @@ class AMP(PPO):
             "discriminator_batch_size": cfg["algorithm"].pop("discriminator_batch_size", 4096),
             "discriminator_updates": cfg["algorithm"].pop("discriminator_updates", 4),
             "discriminator_loss_scale": cfg["algorithm"].pop("discriminator_loss_scale", 5.0),
-            "discriminator_logit_regularization_scale": cfg["algorithm"].pop("discriminator_logit_regularization_scale", 0.05),
+            "discriminator_logit_regularization_scale": cfg["algorithm"].pop(
+                "discriminator_logit_regularization_scale", 0.05
+            ),
             "discriminator_gradient_penalty_scale": cfg["algorithm"].pop("discriminator_gradient_penalty_scale", 5.0),
             "discriminator_weight_decay_scale": cfg["algorithm"].pop("discriminator_weight_decay_scale", 0.0),
             "amp_replay_buffer_size": cfg["algorithm"].pop("amp_replay_buffer_size", 200000),
+            "reference_state_initialization": cfg["algorithm"].pop("reference_state_initialization", False),
             "task_reward_scale": cfg["algorithm"].pop("task_reward_scale", 0.0),
             "style_reward_scale": cfg["algorithm"].pop("style_reward_scale", 1.0),
         }
@@ -453,6 +469,7 @@ class AMP(PPO):
             amp_observation_groups=amp_groups,
             amp_observation_dim=amp_dim,
             collect_reference_motions=motion_dataset.sample_amp_observations,
+            reference_frame_sampler=motion_dataset.sample_reference_frames,
             device=device,
             **cfg["algorithm"],
             **amp_params,
