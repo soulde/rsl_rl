@@ -92,6 +92,8 @@ class BaseMotionDataset(ABC):
 
         self.frame_indices = []
         self.reference_frame_indices = []
+        self._reference_state_field_names: tuple[str, ...] = ()
+        self._validation_applied = False
         for motion_idx, motion in enumerate(self.motions):
             num_frames = motion["joint_pos"].shape[0]
             if num_frames < 1:
@@ -216,6 +218,47 @@ class BaseMotionDataset(ABC):
         reference_frames = self.sample_reference_frames(batch_size)
         return torch.cat((reference_frames["amp_obs"], reference_frames["amp_next_obs"]), dim=-1)
 
+    def set_validate(
+        self,
+        transition_mask: torch.Tensor,
+        reference_state_fields: dict[str, list[torch.Tensor]] | None = None,
+    ) -> None:
+        """Install a one-time transition mask and attach aligned per-frame reset fields."""
+        if self._validation_applied:
+            raise RuntimeError("AMP motion dataset validation has already been installed")
+        if transition_mask.ndim != 1 or transition_mask.numel() != len(self.frame_indices):
+            raise ValueError(
+                "AMP transition validation mask must be one-dimensional with one value per reference transition"
+            )
+
+        prepared_fields: dict[str, list[torch.Tensor]] = {}
+        for field_name, per_motion_values in (reference_state_fields or {}).items():
+            if field_name in self.motions[0]:
+                raise ValueError(f"AMP reference state field already exists: {field_name}")
+            if len(per_motion_values) != len(self.motions):
+                raise ValueError(f"AMP reference state field {field_name!r} must have one tensor per motion")
+            prepared_values = []
+            for motion_index, values in enumerate(per_motion_values):
+                values = torch.as_tensor(values, device=self.motions[motion_index]["joint_pos"].device)
+                expected_frames = self.motions[motion_index]["joint_pos"].shape[0]
+                if values.ndim == 0 or values.shape[0] != expected_frames:
+                    raise ValueError(
+                        f"AMP reference state field {field_name!r} for motion {motion_index} must contain "
+                        f"{expected_frames} frames"
+                    )
+                prepared_values.append(values)
+            prepared_fields[field_name] = prepared_values
+
+        keep = transition_mask.to(device=self.transitions.device, dtype=torch.bool)
+        self.transitions = self.transitions[keep]
+        keep_values = keep.detach().cpu().tolist()
+        self.frame_indices = [frame for frame, valid in zip(self.frame_indices, keep_values, strict=True) if valid]
+        for field_name, per_motion_values in prepared_fields.items():
+            for motion, values in zip(self.motions, per_motion_values, strict=True):
+                motion[field_name] = values
+        self._reference_state_field_names = tuple(prepared_fields)
+        self._validation_applied = True
+
     def sample_reference_frames(self, batch_size: int) -> dict[str, torch.Tensor]:
         """Sample valid AMP transition frames and their aligned reset state.
 
@@ -230,7 +273,7 @@ class BaseMotionDataset(ABC):
         if batch_size == 0:
             empty = self.transitions[:0]
             amp_obs, amp_next_obs = empty.split((self._motion_observation_dim,) * 2, dim=-1)
-            return {
+            sampled = {
                 "amp_obs": amp_obs,
                 "amp_next_obs": amp_next_obs,
                 "joint_pos": self.motions[0]["joint_pos"][:0],
@@ -240,6 +283,9 @@ class BaseMotionDataset(ABC):
                 "root_lin_vel": self.motions[0]["body_lin_vel_w"][:0, 0],
                 "root_ang_vel": self.motions[0]["body_ang_vel_w"][:0, 0],
             }
+            for field_name in self._reference_state_field_names:
+                sampled[field_name] = self.motions[0][field_name][:0]
+            return sampled
 
         transition_ids = torch.randint(len(self.frame_indices), (batch_size,), device=self.transitions.device)
         transitions = self.transitions[transition_ids]
@@ -254,6 +300,7 @@ class BaseMotionDataset(ABC):
             "root_lin_vel": ("body_lin_vel_w", 0),
             "root_ang_vel": ("body_ang_vel_w", 0),
         }
+        state_fields.update({field_name: (field_name, None) for field_name in self._reference_state_field_names})
         sampled = {"amp_obs": amp_obs, "amp_next_obs": amp_next_obs}
         for output_name, (motion_field, body_index) in state_fields.items():
             shape = self.motions[0][motion_field].shape[1:]
