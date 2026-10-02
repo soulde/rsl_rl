@@ -2,7 +2,13 @@ import torch
 import numpy as np
 import pytest
 
-from rsl_rl.algorithms.amp import AmpReplayBuffer, compute_amp_reward, valid_amp_transition_mask
+from rsl_rl.algorithms.amp import (
+    AMP,
+    AmpReplayBuffer,
+    _resolve_rsi_frame_sampler,
+    compute_amp_reward,
+    valid_amp_transition_mask,
+)
 from rsl_rl.datasets import MotionDataset
 
 
@@ -24,17 +30,21 @@ SOMA_TEST_BODY_NAMES = [
 ]
 
 
-def _write_soma_npz(path, *, joint_names=None, body_names=None, frames=3):
+def _write_soma_npz(path, *, joint_names=None, body_names=None, frames=3, zero_pose=False):
     joint_names = joint_names or ["joint_a", "joint_b"]
     body_names = body_names or SOMA_TEST_BODY_NAMES
-    joint_pos = np.arange(frames * len(joint_names), dtype=np.float32).reshape(frames, len(joint_names))
+    joint_pos = (
+        np.zeros((frames, len(joint_names)), dtype=np.float32)
+        if zero_pose
+        else np.arange(frames * len(joint_names), dtype=np.float32).reshape(frames, len(joint_names))
+    )
     body_pos = np.zeros((frames, len(body_names), 3), dtype=np.float32)
     body_pos[:, body_names.index("left_ankle_x_link"), 0] = np.arange(frames, dtype=np.float32)
     np.savez(
         path,
         fps=np.float32(50.0),
         joint_pos=joint_pos,
-        joint_vel=joint_pos + 100.0,
+        joint_vel=np.zeros_like(joint_pos) if zero_pose else joint_pos + 100.0,
         body_pos_w=body_pos,
         body_quat_w=np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (frames, len(body_names), 1)),
         body_lin_vel_w=np.zeros_like(body_pos),
@@ -53,7 +63,9 @@ def test_soma_motion_dataset_requires_embedded_name_contract(tmp_path):
     np.savez(tmp_path / "missing_names.npz", **payload)
 
     with pytest.raises(ValueError, match="SOMA.*joint_names.*body_names"):
-        SomaMotionDataset(str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"])
+        SomaMotionDataset(
+            str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+        )
 
 
 def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_frames(tmp_path):
@@ -73,6 +85,133 @@ def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_fr
     assert torch.equal(dataset.motions[0]["joint_pos"][:, 0], torch.tensor([0.0, 2.0, 4.0]))
     assert torch.equal(dataset.motions[0]["joint_vel"][:, 1], torch.tensor([101.0, 103.0, 105.0]))
     assert torch.equal(dataset.transitions[:, 13].sort().values, torch.tensor([0.0, 2.0]))
+
+
+def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    expert_dir = tmp_path / "expert"
+    rsi_dir = tmp_path / "rsi"
+    expert_dir.mkdir()
+    rsi_dir.mkdir()
+    _write_soma_npz(expert_dir / "walk.npz", frames=3)
+    _write_soma_npz(rsi_dir / "zero_pose.npz", frames=1, zero_pose=True)
+    expert_dataset = SomaMotionDataset(
+        str(expert_dir),
+        amp_observation_dim=20,
+        key_body_names=["left_ankle_x_link"],
+        body_names=SOMA_TEST_BODY_NAMES,
+        joint_names=["joint_a", "joint_b"],
+    )
+    dataset = SomaMotionDataset(
+        str(rsi_dir),
+        amp_observation_dim=20,
+        key_body_names=["left_ankle_x_link"],
+        body_names=SOMA_TEST_BODY_NAMES,
+        joint_names=["joint_a", "joint_b"],
+        require_transitions=False,
+    )
+
+    sampled = dataset.sample_reference_states(5)
+
+    assert dataset.transitions.shape == (0, 40)
+    assert sampled["joint_pos"].shape == (5, 2)
+    assert torch.equal(sampled["joint_pos"], torch.zeros(5, 2))
+    assert torch.equal(sampled["joint_vel"], torch.zeros(5, 2))
+    assert sampled["root_pos"].shape == (5, 3)
+    assert sampled["root_quat_xyzw"].shape == (5, 4)
+    assert torch.equal(sampled["root_quat_xyzw"], torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(5, 4))
+
+    with pytest.raises(RuntimeError, match="no expert transitions"):
+        dataset.sample_amp_observations(1)
+
+    assert len(expert_dataset) == 2
+    assert expert_dataset.sample_amp_observations(4).shape == (4, 40)
+
+
+def test_amp_rsi_sampler_prefers_separate_dataset_and_keeps_legacy_fallback():
+    class Dataset:
+        def sample_reference_frames(self, batch_size):
+            return {"source": "expert", "batch_size": batch_size}
+
+        def sample_reference_states(self, batch_size):
+            return {"source": "rsi", "batch_size": batch_size}
+
+    expert_dataset = Dataset()
+    rsi_dataset = Dataset()
+
+    assert _resolve_rsi_frame_sampler(expert_dataset, rsi_dataset)(3) == {"source": "rsi", "batch_size": 3}
+    assert _resolve_rsi_frame_sampler(expert_dataset)(2) == {"source": "expert", "batch_size": 2}
+
+
+def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import rsl_rl.algorithms.amp as amp_module
+
+    expert_dir = tmp_path / "expert"
+    rsi_dir = tmp_path / "rsi"
+    expert_dir.mkdir()
+    rsi_dir.mkdir()
+    _write_soma_npz(expert_dir / "walk.npz", frames=3)
+    _write_soma_npz(rsi_dir / "zero_pose.npz", frames=1, zero_pose=True)
+
+    class Model:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def to(self, device):
+            return self
+
+    class Algorithm:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    class Storage:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(
+        amp_module,
+        "resolve_callable",
+        lambda name: {"fake_amp": Algorithm, "fake_model": Model}[name],
+    )
+    monkeypatch.setattr(amp_module, "resolve_obs_groups", lambda obs, groups, defaults: groups)
+    monkeypatch.setattr(amp_module, "resolve_rnd_config", lambda cfg, obs, groups, env: cfg)
+    monkeypatch.setattr(amp_module, "resolve_symmetry_config", lambda cfg, env: cfg)
+    monkeypatch.setattr(amp_module, "RolloutStorage", Storage)
+
+    obs = {"amp": torch.zeros(1, 20)}
+    cfg = {
+        "algorithm": {
+            "class_name": "fake_amp",
+            "motion_dir": str(expert_dir),
+            "rsi_motion_dir": str(rsi_dir),
+            "motion_dataset_format": "soma",
+            "joint_names": ["joint_a", "joint_b"],
+            "body_names": SOMA_TEST_BODY_NAMES,
+            "key_body_names": ["left_ankle_x_link"],
+            "observation_profile": "default",
+            "reference_state_initialization": True,
+        },
+        "actor": {"class_name": "fake_model"},
+        "critic": {"class_name": "fake_model"},
+        "obs_groups": {"actor": [], "critic": [], "discriminator": ["amp"]},
+        "num_steps_per_env": 1,
+        "multi_gpu": {},
+    }
+    env = SimpleNamespace(
+        num_actions=2,
+        num_envs=1,
+        unwrapped=SimpleNamespace(cfg=SimpleNamespace(sim=SimpleNamespace(dt=0.02), decimation=1)),
+    )
+
+    algorithm = AMP.construct_algorithm(obs, env, cfg, "cpu")
+
+    assert algorithm.kwargs["collect_reference_motions"](4).shape == (4, 40)
+    sampled_rsi = algorithm.kwargs["reference_frame_sampler"](5)
+    assert torch.equal(sampled_rsi["joint_pos"], torch.zeros(5, 2))
+    assert algorithm.kwargs["reference_state_initialization"] is True
 
 
 def test_motion_dataset_normalizes_body_order_and_quaternion_to_isaacsim(tmp_path):
@@ -134,7 +273,9 @@ def test_soma_motion_dataset_rejects_body_name_mismatch(tmp_path):
     _write_soma_npz(tmp_path / "walk.npz", body_names=mismatched)
 
     with pytest.raises(ValueError, match="body_names"):
-        SomaMotionDataset(str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"])
+        SomaMotionDataset(
+            str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+        )
 
 
 def test_amp_motion_dataset_format_selects_soma_and_defaults_to_beyondmimic():
