@@ -41,6 +41,14 @@ cd rsl_rl
 pip install -e .
 ```
 
+### AMP reference-state initialization
+
+AMP uses `algorithm.motion_dir` for expert transitions. With
+`algorithm.reference_state_initialization: true`, an optional
+`algorithm.rsi_motion_dir` can point to a separate directory of reset-state NPZ files. RSI samples
+frames from this directory independently; clips may contain a single frame and do not contribute
+expert transitions. If `rsi_motion_dir` is omitted, RSI continues to sample from `motion_dir`.
+
 ## Citation
 
 If you use RSL-RL in your research, please cite the [paper](https://arxiv.org/abs/2509.10771):

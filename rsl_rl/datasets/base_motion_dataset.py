@@ -27,6 +27,7 @@ class BaseMotionDataset(ABC):
         quaternion_format: str = "wxyz",
         motion_file_pattern: str | None = None,
         motion_files: list[str] | None = None,
+        require_transitions: bool = True,
     ):
         self.device = device
         self.amp_observation_dim = amp_observation_dim
@@ -37,6 +38,7 @@ class BaseMotionDataset(ABC):
         self.time_between_frames = time_between_frames
         self.key_body_names = key_body_names
         self.joint_names = joint_names
+        self.require_transitions = require_transitions
         self.quaternion_format = quaternion_format.lower()
         if self.quaternion_format not in {"wxyz", "xyzw"}:
             raise ValueError("quaternion_format must be 'wxyz' or 'xyzw'")
@@ -89,10 +91,14 @@ class BaseMotionDataset(ABC):
             raise ValueError("The chocolate AMP observation profile requires key_body_names and motion body_names")
 
         self.frame_indices = []
+        self.reference_frame_indices = []
         for motion_idx, motion in enumerate(self.motions):
             num_frames = motion["joint_pos"].shape[0]
-            if num_frames < 2:
+            if num_frames < 1:
+                raise ValueError(f"AMP motion {motion_idx} must contain at least one frame")
+            if self.require_transitions and num_frames < 2:
                 raise ValueError(f"AMP motion {motion_idx} must contain at least two frames")
+            self.reference_frame_indices.extend((motion_idx, frame_idx) for frame_idx in range(num_frames))
             for frame_idx in range(num_frames - 1):
                 self.frame_indices.append((motion_idx, frame_idx))
 
@@ -112,10 +118,14 @@ class BaseMotionDataset(ABC):
             print(f"  joints={self.num_joints}, key_bodies={num_key_bodies}")
 
         observations = [self._all_observations(motion).to(device) for motion in self.motions]
-        self.transitions = torch.cat([torch.cat((obs[:-1], obs[1:]), dim=-1) for obs in observations])
-        if self.transitions.shape[-1] % 2:
-            raise RuntimeError("AMP expert transitions must contain equally sized current and next observations")
-        self._motion_observation_dim = self.transitions.shape[-1] // 2
+        self._motion_observation_dim = observations[0].shape[-1]
+        if self.require_transitions:
+            self.transitions = torch.cat([torch.cat((obs[:-1], obs[1:]), dim=-1) for obs in observations])
+            if self.transitions.shape[-1] % 2:
+                raise RuntimeError("AMP expert transitions must contain equally sized current and next observations")
+            self._motion_observation_dim = self.transitions.shape[-1] // 2
+        else:
+            self.transitions = torch.empty((0, 2 * self._motion_observation_dim), device=device)
         print(f"[AMP] Preloaded {len(self.transitions)} expert transitions on {device}")
 
     @staticmethod
@@ -201,6 +211,8 @@ class BaseMotionDataset(ABC):
         motion["joint_vel"] = motion["joint_vel"][:, reorder]
 
     def sample_amp_observations(self, batch_size: int) -> torch.Tensor:
+        if len(self.transitions) == 0:
+            raise RuntimeError("AMP motion dataset has no expert transitions")
         reference_frames = self.sample_reference_frames(batch_size)
         return torch.cat((reference_frames["amp_obs"], reference_frames["amp_next_obs"]), dim=-1)
 
@@ -213,6 +225,8 @@ class BaseMotionDataset(ABC):
         """
         if batch_size < 0:
             raise ValueError("AMP reference batch_size must be non-negative")
+        if len(self.frame_indices) == 0:
+            raise RuntimeError("AMP motion dataset has no expert transitions")
         if batch_size == 0:
             empty = self.transitions[:0]
             amp_obs, amp_next_obs = empty.split((self._motion_observation_dim,) * 2, dim=-1)
@@ -263,6 +277,60 @@ class BaseMotionDataset(ABC):
                 if output_name == "root_pos":
                     # Place each clip's horizontal trajectory around the
                     # selected environment origin while retaining source height.
+                    source = source.clone()
+                    source[:, :2] -= motion[motion_field][0, body_index, :2]
+                sampled[output_name][output_ids] = source
+        return sampled
+
+    def sample_reference_states(self, batch_size: int) -> dict[str, torch.Tensor]:
+        """Sample raw reset states from any frame, including single-frame RSI-only clips."""
+        if batch_size < 0:
+            raise ValueError("AMP reference batch_size must be non-negative")
+        if batch_size == 0:
+            motion = self.motions[0]
+            return {
+                "joint_pos": motion["joint_pos"][:0],
+                "joint_vel": motion["joint_vel"][:0],
+                "root_pos": motion["body_pos_w"][:0, 0],
+                "root_quat_xyzw": motion["body_quat_xyzw"][:0, 0],
+                "root_lin_vel": motion["body_lin_vel_w"][:0, 0],
+                "root_ang_vel": motion["body_ang_vel_w"][:0, 0],
+            }
+        if len(self.reference_frame_indices) == 0:
+            raise RuntimeError("AMP RSI dataset has no reference frames")
+
+        selected_ids = torch.randint(
+            len(self.reference_frame_indices), (batch_size,), device=self.motions[0]["joint_pos"].device
+        )
+        selected_frames = [self.reference_frame_indices[index] for index in selected_ids.cpu().tolist()]
+        state_fields = {
+            "joint_pos": ("joint_pos", None),
+            "joint_vel": ("joint_vel", None),
+            "root_pos": ("body_pos_w", 0),
+            "root_quat_xyzw": ("body_quat_xyzw", 0),
+            "root_lin_vel": ("body_lin_vel_w", 0),
+            "root_ang_vel": ("body_ang_vel_w", 0),
+        }
+        sampled = {}
+        for output_name, (motion_field, body_index) in state_fields.items():
+            source = self.motions[0][motion_field]
+            shape = source.shape[1:] if body_index is None else source.shape[2:]
+            sampled[output_name] = torch.empty(
+                (batch_size, *shape), dtype=source.dtype, device=source.device
+            )
+
+        grouped_frames: dict[int, list[tuple[int, int]]] = {}
+        for output_index, (motion_index, frame_index) in enumerate(selected_frames):
+            grouped_frames.setdefault(motion_index, []).append((output_index, frame_index))
+        for motion_index, frame_pairs in grouped_frames.items():
+            motion = self.motions[motion_index]
+            output_ids = torch.tensor([pair[0] for pair in frame_pairs], device=selected_ids.device)
+            frame_ids = torch.tensor([pair[1] for pair in frame_pairs], device=selected_ids.device)
+            for output_name, (motion_field, body_index) in state_fields.items():
+                source = motion[motion_field][frame_ids]
+                if body_index is not None:
+                    source = source[:, body_index]
+                if output_name == "root_pos":
                     source = source.clone()
                     source[:, :2] -= motion[motion_field][0, body_index, :2]
                 sampled[output_name][output_ids] = source

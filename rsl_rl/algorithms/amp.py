@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from collections.abc import Callable
+from typing import Any
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -50,6 +51,15 @@ def resolve_motion_dataset_class(algorithm_cfg: dict):
         return dataset_classes[dataset_format]
     except KeyError as error:
         raise ValueError(f"Unknown AMP motion dataset format: {dataset_format!r}") from error
+
+
+def _resolve_rsi_frame_sampler(
+    expert_dataset: Any, rsi_dataset: Any | None = None
+) -> Callable[[int], dict[str, torch.Tensor]]:
+    """Keep RSI sampling independent when a dedicated initialization dataset is configured."""
+    if rsi_dataset is not None:
+        return rsi_dataset.sample_reference_states
+    return expert_dataset.sample_reference_frames
 
 
 class AmpReplayBuffer:
@@ -185,7 +195,7 @@ class AMP(PPO):
         return torch.cat([obs[group] for group in self.amp_observation_groups], dim=-1)
 
     def sample_rsi(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Sample reference states through the expert dataset's shared frame sampler."""
+        """Sample aligned reset states from the configured RSI source."""
         if self._reference_frame_sampler is None:
             raise RuntimeError("AMP RSI requested, but no reference-frame sampler was configured")
         if env_ids.ndim != 1:
@@ -389,7 +399,8 @@ class AMP(PPO):
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "AMP":
         """Construct AMP and connect it to the motion dataset.
 
-        The motion dataset is loaded from the path specified in cfg["algorithm"]["motion_dir"].
+        Expert motions use ``motion_dir``. When RSI is enabled, ``rsi_motion_dir`` may
+        independently select its reset-state source; it can contain single-frame clips.
         """
         alg_class: type[AMP] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
@@ -415,6 +426,8 @@ class AMP(PPO):
         motion_dir = cfg["algorithm"].pop("motion_dir", None)
         if motion_dir is None:
             raise ValueError("AMP requires 'motion_dir' to be specified in algorithm config")
+        rsi_motion_dir = cfg["algorithm"].pop("rsi_motion_dir", None)
+        reference_state_initialization = cfg["algorithm"].pop("reference_state_initialization", False)
 
         # Extract body configuration
         key_body_names = cfg["algorithm"].pop("key_body_names", None)
@@ -442,6 +455,21 @@ class AMP(PPO):
             motion_file_pattern=motion_file_pattern,
             motion_files=motion_files,
         )
+        rsi_motion_dataset = None
+        if reference_state_initialization and rsi_motion_dir:
+            rsi_motion_dataset = motion_dataset_class(
+                motion_dir=rsi_motion_dir,
+                device=device,
+                amp_observation_dim=amp_dim,
+                include_root_height=include_root_height,
+                observation_profile=observation_profile,
+                time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
+                key_body_names=key_body_names,
+                body_names=body_names,
+                joint_names=joint_names,
+                quaternion_format=quaternion_format,
+                require_transitions=False,
+            )
 
         # Extract AMP-specific parameters from config
         amp_params = {
@@ -457,7 +485,7 @@ class AMP(PPO):
             "discriminator_gradient_penalty_scale": cfg["algorithm"].pop("discriminator_gradient_penalty_scale", 5.0),
             "discriminator_weight_decay_scale": cfg["algorithm"].pop("discriminator_weight_decay_scale", 0.0),
             "amp_replay_buffer_size": cfg["algorithm"].pop("amp_replay_buffer_size", 200000),
-            "reference_state_initialization": cfg["algorithm"].pop("reference_state_initialization", False),
+            "reference_state_initialization": reference_state_initialization,
             "task_reward_scale": cfg["algorithm"].pop("task_reward_scale", 0.0),
             "style_reward_scale": cfg["algorithm"].pop("style_reward_scale", 1.0),
         }
@@ -469,7 +497,7 @@ class AMP(PPO):
             amp_observation_groups=amp_groups,
             amp_observation_dim=amp_dim,
             collect_reference_motions=motion_dataset.sample_amp_observations,
-            reference_frame_sampler=motion_dataset.sample_reference_frames,
+            reference_frame_sampler=_resolve_rsi_frame_sampler(motion_dataset, rsi_motion_dataset),
             device=device,
             **cfg["algorithm"],
             **amp_params,
