@@ -136,12 +136,14 @@ class AMP(PPO):
         amp_replay_buffer_size: int = 200_000,
         task_reward_scale: float = 0.0,
         style_reward_scale: float = 1.0,
+        reference_motion_dataset: Any | None = None,
         **kwargs,
     ):
         super().__init__(actor, critic, storage, **kwargs)
         self.amp_observation_groups = amp_observation_groups
         self.collect_reference_motions = collect_reference_motions
         self._reference_frame_sampler = reference_frame_sampler
+        self.reference_motion_dataset = reference_motion_dataset
         self.reference_state_initialization = reference_state_initialization
         self.discriminator_batch_size = discriminator_batch_size
         self.discriminator_updates = discriminator_updates
@@ -498,6 +500,7 @@ class AMP(PPO):
             amp_observation_dim=amp_dim,
             collect_reference_motions=motion_dataset.sample_amp_observations,
             reference_frame_sampler=_resolve_rsi_frame_sampler(motion_dataset, rsi_motion_dataset),
+            reference_motion_dataset=motion_dataset,
             device=device,
             **cfg["algorithm"],
             **amp_params,

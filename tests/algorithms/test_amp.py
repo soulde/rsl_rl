@@ -129,6 +129,36 @@ def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
     assert expert_dataset.sample_amp_observations(4).shape == (4, 40)
 
 
+def test_motion_dataset_set_validate_filters_transitions_and_attaches_aligned_reset_fields(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    _write_soma_npz(tmp_path / "walk.npz", frames=3)
+    dataset = SomaMotionDataset(
+        str(tmp_path),
+        amp_observation_dim=20,
+        key_body_names=["left_ankle_x_link"],
+        body_names=SOMA_TEST_BODY_NAMES,
+        joint_names=["joint_a", "joint_b"],
+    )
+    motor_positions = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    motor_velocities = motor_positions + 10.0
+
+    dataset.set_validate(
+        torch.tensor([False, True]),
+        reference_state_fields={
+            "motor_joint_pos": [motor_positions],
+            "motor_joint_vel": [motor_velocities],
+        },
+    )
+
+    assert len(dataset) == 1
+    assert dataset.transitions.shape == (1, 40)
+    sampled = dataset.sample_reference_frames(4)
+    assert torch.equal(sampled["joint_pos"], dataset.motions[0]["joint_pos"][1:2].expand(4, -1))
+    assert torch.equal(sampled["motor_joint_pos"], motor_positions[1:2].expand(4, -1))
+    assert torch.equal(sampled["motor_joint_vel"], motor_velocities[1:2].expand(4, -1))
+
+
 def test_amp_rsi_sampler_prefers_separate_dataset_and_keeps_legacy_fallback():
     class Dataset:
         def sample_reference_frames(self, batch_size):
