@@ -41,11 +41,12 @@ def valid_amp_transition_mask(dones: torch.Tensor) -> torch.Tensor:
 def resolve_motion_dataset_class(algorithm_cfg: dict):
     """Resolve the configured AMP expert-motion dataset implementation."""
     dataset_format = algorithm_cfg.get("motion_dataset_format", "beyondmimic")
-    from rsl_rl.datasets import MotionDataset, SomaMotionDataset
+    from rsl_rl.datasets import MotionDataset, SomaMotionDataset, VariableDofMotionDataset
 
     dataset_classes = {
         "beyondmimic": MotionDataset,
         "soma": SomaMotionDataset,
+        "variable_dof": VariableDofMotionDataset,
     }
     try:
         return dataset_classes[dataset_format]
@@ -442,6 +443,14 @@ class AMP(PPO):
         motion_files = cfg["algorithm"].pop("motion_files", None)
 
         motion_dataset_class = resolve_motion_dataset_class(cfg["algorithm"])
+        rsi_joint_names = cfg["algorithm"].pop("rsi_joint_names", None)
+        dataset_options = {}
+        if rsi_joint_names is not None:
+            from rsl_rl.datasets import VariableDofMotionDataset
+
+            if motion_dataset_class is not VariableDofMotionDataset:
+                raise ValueError("rsi_joint_names requires motion_dataset_format='variable_dof'")
+            dataset_options["rsi_joint_names"] = rsi_joint_names
         cfg["algorithm"].pop("motion_dataset_format", None)
         motion_dataset = motion_dataset_class(
             motion_dir=motion_dir,
@@ -456,6 +465,7 @@ class AMP(PPO):
             quaternion_format=quaternion_format,
             motion_file_pattern=motion_file_pattern,
             motion_files=motion_files,
+            **dataset_options,
         )
         rsi_motion_dataset = None
         if reference_state_initialization and rsi_motion_dir:
@@ -471,6 +481,7 @@ class AMP(PPO):
                 joint_names=joint_names,
                 quaternion_format=quaternion_format,
                 require_transitions=False,
+                **dataset_options,
             )
 
         # Extract AMP-specific parameters from config

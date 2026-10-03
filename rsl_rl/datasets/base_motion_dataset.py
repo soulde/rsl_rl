@@ -13,6 +13,9 @@ from abc import ABC, abstractmethod
 class BaseMotionDataset(ABC):
     """Format-neutral AMP dataset pipeline for NPZ motion records."""
 
+    reference_joint_pos_field = "joint_pos"
+    reference_joint_vel_field = "joint_vel"
+
     def __init__(
         self,
         motion_dir: str,
@@ -107,9 +110,10 @@ class BaseMotionDataset(ABC):
         num_bodies = self.motions[0]["body_pos_w"].shape[1]
         num_key_bodies = len(self.key_body_indices) if self.key_body_indices is not None else num_bodies
         if self.observation_profile == "chocolate":
-            expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 6
+            expected_dim = self.num_joints + self.motions[0]["joint_vel"].shape[-1] + num_key_bodies * 3 + 6
         else:
-            expected_dim = self.num_joints * 2 + num_key_bodies * 3 + 12 + int(self.include_root_height)
+            expected_dim = (self.num_joints + self.motions[0]["joint_vel"].shape[-1]
+                            + num_key_bodies * 3 + 12 + int(self.include_root_height))
         if self.amp_observation_dim != expected_dim:
             if self.observation_profile == "chocolate":
                 raise ValueError(
@@ -276,8 +280,8 @@ class BaseMotionDataset(ABC):
             sampled = {
                 "amp_obs": amp_obs,
                 "amp_next_obs": amp_next_obs,
-                "joint_pos": self.motions[0]["joint_pos"][:0],
-                "joint_vel": self.motions[0]["joint_vel"][:0],
+                "joint_pos": self.motions[0][self.reference_joint_pos_field][:0],
+                "joint_vel": self.motions[0][self.reference_joint_vel_field][:0],
                 "root_pos": self.motions[0]["body_pos_w"][:0, 0],
                 "root_quat_xyzw": self.motions[0]["body_quat_xyzw"][:0, 0],
                 "root_lin_vel": self.motions[0]["body_lin_vel_w"][:0, 0],
@@ -293,8 +297,8 @@ class BaseMotionDataset(ABC):
         selected_frames = [self.frame_indices[index] for index in transition_ids.cpu().tolist()]
 
         state_fields = {
-            "joint_pos": ("joint_pos", None),
-            "joint_vel": ("joint_vel", None),
+            "joint_pos": (self.reference_joint_pos_field, None),
+            "joint_vel": (self.reference_joint_vel_field, None),
             "root_pos": ("body_pos_w", 0),
             "root_quat_xyzw": ("body_quat_xyzw", 0),
             "root_lin_vel": ("body_lin_vel_w", 0),
@@ -336,8 +340,8 @@ class BaseMotionDataset(ABC):
         if batch_size == 0:
             motion = self.motions[0]
             return {
-                "joint_pos": motion["joint_pos"][:0],
-                "joint_vel": motion["joint_vel"][:0],
+                "joint_pos": motion[self.reference_joint_pos_field][:0],
+                "joint_vel": motion[self.reference_joint_vel_field][:0],
                 "root_pos": motion["body_pos_w"][:0, 0],
                 "root_quat_xyzw": motion["body_quat_xyzw"][:0, 0],
                 "root_lin_vel": motion["body_lin_vel_w"][:0, 0],
@@ -351,8 +355,8 @@ class BaseMotionDataset(ABC):
         )
         selected_frames = [self.reference_frame_indices[index] for index in selected_ids.cpu().tolist()]
         state_fields = {
-            "joint_pos": ("joint_pos", None),
-            "joint_vel": ("joint_vel", None),
+            "joint_pos": (self.reference_joint_pos_field, None),
+            "joint_vel": (self.reference_joint_vel_field, None),
             "root_pos": ("body_pos_w", 0),
             "root_quat_xyzw": ("body_quat_xyzw", 0),
             "root_lin_vel": ("body_lin_vel_w", 0),

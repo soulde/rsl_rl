@@ -8,5 +8,6 @@
 from .base_motion_dataset import BaseMotionDataset
 from .motion_dataset import MotionDataset
 from .soma_motion_dataset import SomaMotionDataset
+from .variable_dof_motion_dataset import VariableDofMotionDataset
 
-__all__ = ["BaseMotionDataset", "MotionDataset", "SomaMotionDataset"]
+__all__ = ["BaseMotionDataset", "MotionDataset", "SomaMotionDataset", "VariableDofMotionDataset"]
