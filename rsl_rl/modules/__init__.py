@@ -10,16 +10,19 @@ from .distribution import BetaDistribution, Distribution, GaussianDistribution, 
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
+from .transformer import CrossAttention, SinusoidalPositionalEncoding
 
 __all__ = [
     "CNN",
     "MLP",
     "RNN",
     "BetaDistribution",
+    "CrossAttention",
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "SinusoidalPositionalEncoding",
 ]

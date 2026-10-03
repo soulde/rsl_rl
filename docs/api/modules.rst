@@ -25,6 +25,18 @@ CNN
    :undoc-members:
 
 
+Transformer
+-----------
+
+The Transformer building blocks operate on batch-first tensors. ``SinusoidalPositionalEncoding`` adds fixed position
+features to rank-3 ``[batch, time, width]`` inputs. ``CrossAttention`` reads key/value tokens from query tokens and
+accepts optional attention and key-padding masks.
+
+.. automodule:: rsl_rl.modules.transformer
+   :members:
+   :undoc-members:
+
+
 Normalization
 -------------
 
@@ -39,4 +51,3 @@ Distribution
 .. automodule:: rsl_rl.modules.distribution
    :members:
    :undoc-members:
-
