@@ -44,9 +44,10 @@ class OnPolicyRunner:
             if not callable(sample_rsi):
                 raise RuntimeError("Reference-state initialization is enabled but the algorithm has no sample_rsi API")
             self.env.unwrapped._amp_rsi_sampler = sample_rsi
-            reference_motion_dataset = getattr(self.alg, "reference_motion_dataset", None)
-            if reference_motion_dataset is not None:
-                self.env.unwrapped._amp_rsi_motion_dataset = reference_motion_dataset
+            get_layout = getattr(self.alg, "get_rsi_joint_layout", None)
+            if not callable(get_layout):
+                raise RuntimeError("Reference-state initialization requires a get_rsi_joint_layout API")
+            self.env.unwrapped._amp_rsi_joint_layout = get_layout()
             # The environment creates an initial observation before the agent
             # exists. Reset after registering the sampler so the first rollout
             # also starts from a reference motion.

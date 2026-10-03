@@ -16,6 +16,7 @@ from typing import Any
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
+from rsl_rl.datasets.rsi_contract import RsiJointLayout, RsiState, reference_joint_layout, reference_state
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import MLP, EmpiricalNormalization
@@ -197,13 +198,21 @@ class AMP(PPO):
     def _get_amp_observations(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[group] for group in self.amp_observation_groups], dim=-1)
 
-    def sample_rsi(self, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+    def get_rsi_joint_layout(self) -> RsiJointLayout:
+        """Return fixed coordinate metadata; independent of the per-reset sampled frame."""
+        if getattr(self, "_rsi_joint_layout", None) is None:
+            self._rsi_joint_layout = reference_joint_layout(self.reference_motion_dataset)
+        return dict(self._rsi_joint_layout)
+
+    def sample_rsi(self, env_ids: torch.Tensor) -> RsiState:
         """Sample aligned reset states from the configured RSI source."""
         if self._reference_frame_sampler is None:
             raise RuntimeError("AMP RSI requested, but no reference-frame sampler was configured")
         if env_ids.ndim != 1:
             raise ValueError(f"AMP RSI env_ids must be one-dimensional, got shape {tuple(env_ids.shape)}")
-        return self._reference_frame_sampler(int(env_ids.numel()))
+        layout = self.get_rsi_joint_layout()
+        count = int(env_ids.numel())
+        return reference_state(self._reference_frame_sampler(count), count, layout)
 
     def _normalize_amp_transitions(self, transitions: torch.Tensor) -> torch.Tensor:
         state, next_state = transitions.split(self.amp_state_dim, dim=-1)
