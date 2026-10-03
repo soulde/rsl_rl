@@ -1,6 +1,60 @@
 Configuration
 =============
 
+Variable-DOF AMP motion data
+----------------------------
+
+Select the named-joint NPZ loader in the algorithm configuration:
+
+.. code-block:: python
+
+   algorithm = {
+       "class_name": "rsl_rl.algorithms:AMP",
+       "motion_dataset_format": "variable_dof",
+       "motion_dir": "motions/robot",
+       "joint_names": ["left_ankle_pitch_joint", "left_ankle_roll_joint"],
+       "rsi_joint_names": None,  # Default: use the same joints as AMP.
+       "key_body_names": ["left_ankle_roll_link"],
+       "motion_quaternion_format": "wxyz",
+       "observation_profile": "chocolate",
+   }
+
+``VariableDofMotionDataset`` reads ``schema_version="named-joints-v1"`` records.
+``joint_names`` and ``joint_types`` describe all named joints. Integer
+``joint_pos_offsets`` and ``joint_vel_offsets`` each contain one more entry than
+the joint count: zero, the start of every subsequent block, and the final width.
+Supported types and position/velocity widths are ``hinge`` (1/1), ``slide`` (1/1),
+``ball`` (4/3), and ``free`` (7/6). Ball quaternions and the last four free-joint
+position coordinates are WXYZ; the file's ``quaternion_order`` must be ``wxyz``.
+
+AMP features gather the configured ``joint_names`` in configuration order; a
+ball's four position coordinates and three velocity coordinates remain distinct.
+The root and body arrays retain the existing world-coordinate NPZ contract.
+``key_body_names`` selects only points already present in ``body_names`` and the
+corresponding body arrays. Sites, synthetic points and MJCF parsing are not
+performed by this loader. Missing configured joints or points raise errors.
+
+``rsi_joint_names`` independently selects RSI joints, including ball joints and
+motor joints that need not appear in the discriminator input. Omission or ``None``
+uses the AMP ``joint_names`` selection; an explicit empty list is an error.
+When neither list is configured, both use all joints in the first clip's order.
+This option is supported only by the ``variable_dof`` loader; leaving it ``None``
+preserves the behavior of older loaders.
+
+Both ``sample_reference_frames`` and ``sample_reference_states`` return the RSI-selected
+joint positions and velocities as ``joint_pos``/``joint_vel``, plus ``joint_names``,
+``joint_types``, both offsets lists, and ``quaternion_order``. The returned
+joint contract follows the RSI selection order; later clips are reordered by name.
+``amp_obs``/``amp_next_obs`` contain only the selected AMP coordinates. Expert
+transition sampling and RSI share the existing reference-frame sampling path.
+Simulator-specific quaternion conversion belongs at the state-write boundary.
+The environment must consume the named joint contract when this loader is enabled;
+legacy reset events expecting one scalar per joint are not compatible.
+
+The default ``motion_dataset_format="beyondmimic"`` and the ``"soma"`` loader
+are unchanged. A separate RSI motion directory may still hold a single-frame
+record using the same schema.
+
 RSL-RL is configured with a dictionary that is passed to RSL-RL's runner during initialization. The dictionary is
 usually read from a YAML file or constructed from Python dataclasses, such as in 
 `Isaac Lab <https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_rl/isaaclab_rl/rsl_rl/rl_cfg.py>`__. 
