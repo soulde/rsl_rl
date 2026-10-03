@@ -146,7 +146,7 @@ class GaussianDistribution(Distribution):
         output_dim: int,
         init_std: float = 1.0,
         std_range: tuple[float, float] = (1e-6, 1e6),
-        std_type: str = "scalar",
+        std_type: str = "log",
         learn_std: bool = True,
     ) -> None:
         """Initialize the Gaussian distribution module.
@@ -255,7 +255,7 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
         output_dim: int,
         init_std: float = 1.0,
         std_range: tuple[float, float] = (1e-6, 1e6),
-        std_type: str = "scalar",
+        std_type: str = "log",
     ) -> None:
         """Initialize the heteroscedastic Gaussian distribution module.
 
