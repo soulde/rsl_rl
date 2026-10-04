@@ -196,6 +196,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        auxiliary_loss_sums: dict[str, float] = {}
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -277,6 +278,14 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
+            # Algorithms layered on PPO (for example AMP) can contribute a
+            # minibatch loss to this same optimizer step.
+            auxiliary_loss, auxiliary_metrics = self._compute_auxiliary_loss(batch, original_batch_size)
+            if auxiliary_loss is not None:
+                loss = loss + auxiliary_loss
+            for name, value in auxiliary_metrics.items():
+                auxiliary_loss_sums[name] = auxiliary_loss_sums.get(name, 0.0) + float(value.detach().item())
+
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
 
@@ -337,11 +346,17 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        for name, value in auxiliary_loss_sums.items():
+            loss_dict[name] = value / num_updates
 
         # Clear the storage
         self.storage.clear()
 
         return loss_dict
+
+    def _compute_auxiliary_loss(self, batch, original_batch_size: int) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        """Return an optional loss and metrics to include in each PPO minibatch step."""
+        return None, {}
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

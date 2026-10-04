@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from collections.abc import Callable
 from typing import Any
 from tensordict import TensorDict
@@ -168,20 +167,21 @@ class AMP(PPO):
         discriminator_parameters = list(self.discriminator.parameters())
         head_linears = [module for module in self.discriminator.modules() if isinstance(module, nn.Linear)]
         head_param_ids = {id(p) for module in head_linears[-1:] for p in module.parameters()}
-        self.discriminator_optimizer = optim.Adam(
-            [
-                {
-                    "params": [p for p in discriminator_parameters if id(p) not in head_param_ids],
-                    "weight_decay": 10.0e-4,
-                    "name": "amp_trunk",
-                },
-                {
-                    "params": [p for p in discriminator_parameters if id(p) in head_param_ids],
-                    "weight_decay": 10.0e-2,
-                    "name": "amp_head",
-                },
-            ],
-            lr=discriminator_learning_rate,
+        # AMP-Go uses one Adam optimizer and updates its discriminator on each
+        # PPO minibatch. Keep separate decay groups while sharing that optimizer.
+        self.optimizer.add_param_group(
+            {
+                "params": [p for p in discriminator_parameters if id(p) not in head_param_ids],
+                "weight_decay": 10.0e-4,
+                "name": "amp_trunk",
+            }
+        )
+        self.optimizer.add_param_group(
+            {
+                "params": [p for p in discriminator_parameters if id(p) in head_param_ids],
+                "weight_decay": 10.0e-2,
+                "name": "amp_head",
+            }
         )
         # One shared scaler is updated from policy/replay/expert states and is
         # applied independently to both sides of every transition.
@@ -192,6 +192,7 @@ class AMP(PPO):
             self.device,
         )
         self._rollout_amp_transitions: list[torch.Tensor] = []
+        self._amp_update_online: torch.Tensor | None = None
         self._current_amp_observations: torch.Tensor | None = None
         self.style_rewards = torch.zeros(1, device=self.device)
 
@@ -277,102 +278,78 @@ class AMP(PPO):
     def update(self) -> dict[str, float]:
         online = torch.cat(self._rollout_amp_transitions, dim=0) if self._rollout_amp_transitions else None
         self._rollout_amp_transitions.clear()
-
-        ppo_losses = super().update()
+        self._amp_update_online = online
+        try:
+            losses = super().update()
+        finally:
+            self._amp_update_online = None
         if online is not None:
-            # Chocolate trains the discriminator with the same KL-adaptive
-            # learning rate as the policy (shared optimizer); mirror that by
-            # syncing the discriminator lr to the post-update policy lr.
-            for param_group in self.discriminator_optimizer.param_groups:
-                param_group["lr"] = self.learning_rate
-            discriminator_losses = self._update_discriminator(online)
             self.amp_replay_buffer.add(online)
-            ppo_losses.update(discriminator_losses)
-        return ppo_losses
+        losses["amp_style_reward"] = self.style_rewards.mean().item()
+        return losses
 
-    def _update_discriminator(self, online: torch.Tensor) -> dict[str, float]:
-        mean_prediction_loss = 0.0
-        mean_gradient_penalty = 0.0
-        mean_total_loss = 0.0
+    def _compute_auxiliary_loss(
+        self, batch, original_batch_size: int
+    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+        online = self._amp_update_online
+        if online is None or online.shape[0] == 0:
+            return None, {}
 
-        for _ in range(self.discriminator_updates):
-            policy_indexes = torch.randint(
-                online.shape[0],
-                (self.discriminator_batch_size,),
-                device=online.device,
+        # AMP-Go samples one discriminator minibatch alongside every PPO
+        # minibatch, using the PPO minibatch size for both streams.
+        batch_size = original_batch_size
+        indexes = torch.randint(online.shape[0], (batch_size,), device=online.device)
+        policy_samples = online[indexes]
+        replay_samples = (
+            self.amp_replay_buffer.sample(batch_size)
+            if self.amp_replay_buffer.size > 0
+            else policy_samples
+        )
+        expert_samples = self.collect_reference_motions(batch_size).to(self.device)
+
+        with torch.no_grad():
+            states = torch.cat(
+                (
+                    *policy_samples.split(self.amp_state_dim, dim=-1),
+                    *replay_samples.split(self.amp_state_dim, dim=-1),
+                    *expert_samples.split(self.amp_state_dim, dim=-1),
+                ),
+                dim=0,
             )
-            policy_samples = online[policy_indexes]
-            replay_samples = (
-                self.amp_replay_buffer.sample(self.discriminator_batch_size)
-                if self.amp_replay_buffer.size > 0
-                else policy_samples
+            self.amp_normalizer.update(states)
+        policy_samples = self._normalize_amp_transitions(policy_samples)
+        replay_samples = self._normalize_amp_transitions(replay_samples)
+        expert_samples = self._normalize_amp_transitions(expert_samples).requires_grad_(True)
+
+        policy_predictions = self.discriminator(torch.cat((policy_samples, replay_samples), dim=0))
+        expert_predictions = self.discriminator(expert_samples)
+        prediction_loss = 0.5 * (
+            F.mse_loss(policy_predictions, -torch.ones_like(policy_predictions))
+            + F.mse_loss(expert_predictions, torch.ones_like(expert_predictions))
+        )
+        loss = prediction_loss
+        last_linear = [module for module in self.discriminator.modules() if isinstance(module, nn.Linear)][-1]
+        loss = loss + self.discriminator_logit_regularization_scale * last_linear.weight.square().sum()
+        expert_gradient = torch.autograd.grad(
+            expert_predictions,
+            expert_samples,
+            grad_outputs=torch.ones_like(expert_predictions),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        gradient_penalty = expert_gradient.square().sum(dim=-1).mean()
+        loss = loss + self.discriminator_gradient_penalty_scale * gradient_penalty
+        if self.discriminator_weight_decay_scale:
+            all_weights = torch.cat(
+                [module.weight.flatten() for module in self.discriminator.modules() if isinstance(module, nn.Linear)]
             )
-            expert_samples = self.collect_reference_motions(self.discriminator_batch_size).to(self.device)
-
-            with torch.no_grad():
-                states = torch.cat(
-                    (
-                        *policy_samples.split(self.amp_state_dim, dim=-1),
-                        *replay_samples.split(self.amp_state_dim, dim=-1),
-                        *expert_samples.split(self.amp_state_dim, dim=-1),
-                    ),
-                    dim=0,
-                )
-                self.amp_normalizer.update(states)
-            policy_samples = self._normalize_amp_transitions(policy_samples)
-            replay_samples = self._normalize_amp_transitions(replay_samples)
-            expert_samples = self._normalize_amp_transitions(expert_samples).requires_grad_(True)
-
-            policy_predictions = self.discriminator(torch.cat((policy_samples, replay_samples), dim=0))
-            expert_predictions = self.discriminator(expert_samples)
-            prediction_loss = 0.5 * (
-                F.mse_loss(policy_predictions, -torch.ones_like(policy_predictions))
-                + F.mse_loss(expert_predictions, torch.ones_like(expert_predictions))
-            )
-            loss = prediction_loss
-
-            last_linear = [module for module in self.discriminator.modules() if isinstance(module, nn.Linear)][-1]
-            loss = loss + self.discriminator_logit_regularization_scale * last_linear.weight.square().sum()
-
-            expert_gradient = torch.autograd.grad(
-                expert_predictions,
-                expert_samples,
-                grad_outputs=torch.ones_like(expert_predictions),
-                create_graph=True,
-                retain_graph=True,
-                only_inputs=True,
-            )[0]
-            gradient_penalty = expert_gradient.square().sum(dim=-1).mean()
-            loss = loss + self.discriminator_gradient_penalty_scale * gradient_penalty
-            # Weight decay lives in the optimizer param groups (chocolate
-            # layout); the in-loss all-layer term stays available but
-            # defaults off.
-            if self.discriminator_weight_decay_scale:
-                all_weights = torch.cat(
-                    [
-                        module.weight.flatten()
-                        for module in self.discriminator.modules()
-                        if isinstance(module, nn.Linear)
-                    ]
-                )
-                loss = loss + self.discriminator_weight_decay_scale * all_weights.square().sum()
-            loss = self.discriminator_loss_scale * loss
-
-            self.discriminator_optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.max_grad_norm)
-            self.discriminator_optimizer.step()
-
-            mean_prediction_loss += prediction_loss.item()
-            mean_gradient_penalty += gradient_penalty.item()
-            mean_total_loss += loss.item()
-
-        divisor = float(self.discriminator_updates)
-        return {
-            "amp_discriminator": mean_total_loss / divisor,
-            "amp_prediction": mean_prediction_loss / divisor,
-            "amp_gradient_penalty": mean_gradient_penalty / divisor,
-            "amp_style_reward": self.style_rewards.mean().item(),
+            loss = loss + self.discriminator_weight_decay_scale * all_weights.square().sum()
+        loss = self.discriminator_loss_scale * loss
+        return loss, {
+            "amp_discriminator": loss.detach(),
+            "amp_prediction": prediction_loss.detach(),
+            "amp_gradient_penalty": gradient_penalty.detach(),
         }
 
     def train_mode(self) -> None:
@@ -390,7 +367,6 @@ class AMP(PPO):
         saved_dict.update(
             {
                 "amp_discriminator_state_dict": self.discriminator.state_dict(),
-                "amp_discriminator_optimizer_state_dict": self.discriminator_optimizer.state_dict(),
                 "amp_normalizer_state_dict": self.amp_normalizer.state_dict(),
                 "amp_replay_buffer_state_dict": self.amp_replay_buffer.state_dict(),
             }
@@ -401,7 +377,6 @@ class AMP(PPO):
         load_iteration = super().load(loaded_dict, load_cfg, strict)
         if load_cfg is None or load_cfg.get("amp", True):
             self.discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"], strict=strict)
-            self.discriminator_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
             self.amp_normalizer.load_state_dict(loaded_dict["amp_normalizer_state_dict"], strict=strict)
             if "amp_replay_buffer_state_dict" in loaded_dict:
                 self.amp_replay_buffer.load_state_dict(loaded_dict["amp_replay_buffer_state_dict"])
