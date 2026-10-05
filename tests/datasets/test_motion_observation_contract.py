@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from rsl_rl.datasets import MotionDataset
+from rsl_rl.datasets import MotionDataset, SomaMotionDataset
 
 
 @pytest.mark.parametrize("source_order", ["xyzw", "wxyz"])
@@ -23,12 +23,21 @@ def test_world_features_preserve_order_and_ignore_root_height_rotation(tmp_path,
         body_lin_vel_w=np.tile([1, 2, 3], (2, 3, 1)),
         body_ang_vel_w=np.tile([4, 5, 6], (2, 3, 1)),
     )
-    options = {"quaternion_format": source_order}
-    dataset = MotionDataset(str(tmp_path), key_body_names=["foot", "hand"], **options)
+    if source_order == "xyzw":
+        payload = {}
+        with np.load(tmp_path / "motion.npz") as archive:
+            payload = {key: archive[key] for key in archive.files}
+        payload["joint_names"] = np.array(["j0", "j1"])
+        payload["body_names"] = np.array(["root", "hand", "foot"])
+        np.savez(tmp_path / "motion.npz", **payload)
+        dataset_type = SomaMotionDataset
+    else:
+        dataset_type = MotionDataset
+    dataset = dataset_type(str(tmp_path), key_body_names=["foot", "hand"])
     expected = torch.arange(1, 17, dtype=torch.float32)
     assert dataset.amp_observation_dim == 16
     torch.testing.assert_close(dataset.transitions[0], torch.cat([expected, expected]))
     torch.testing.assert_close(dataset.motions[0]["body_quat_w"][:, 0], torch.tensor(quat))
     torch.testing.assert_close(dataset.motions[0]["body_quat_xyzw"][:, 0], torch.tensor(quat))
     with pytest.raises(ValueError, match="dimension"):
-        MotionDataset(str(tmp_path), key_body_names=["foot", "hand"], amp_observation_dim=23, **options)
+        dataset_type(str(tmp_path), key_body_names=["foot", "hand"], amp_observation_dim=23)

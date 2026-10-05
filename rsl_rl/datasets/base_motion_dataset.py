@@ -15,9 +15,10 @@ class BaseMotionDataset(ABC):
 
     Features concatenate root linear/angular velocity, joint position/velocity,
     and root-relative key-point positions, in that order. Loaded quaternions
-    use XYZW; ``quaternion_format`` describes the input file order.
+    use XYZW; subclasses define the input file order for their dataset format.
     """
 
+    input_quaternion_format = "wxyz"
     reference_joint_pos_field = "joint_pos"
     reference_joint_vel_field = "joint_vel"
 
@@ -30,7 +31,6 @@ class BaseMotionDataset(ABC):
         key_body_names: list[str] | None = None,
         body_names: list[str] | None = None,
         joint_names: list[str] | None = None,
-        quaternion_format: str = "wxyz",
         motion_file_pattern: str | None = None,
         motion_files: list[str] | None = None,
         require_transitions: bool = True,
@@ -41,10 +41,6 @@ class BaseMotionDataset(ABC):
         self.key_body_names = key_body_names
         self.joint_names = joint_names
         self.require_transitions = require_transitions
-        self.quaternion_format = quaternion_format.lower()
-        if self.quaternion_format not in {"wxyz", "xyzw"}:
-            raise ValueError("quaternion_format must be 'wxyz' or 'xyzw'")
-
         self.motions = []
         canonical_body_names = list(body_names) if body_names is not None else None
         discovered_count = len(glob.glob(os.path.join(motion_dir, "*.npz")))

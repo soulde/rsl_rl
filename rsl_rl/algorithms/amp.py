@@ -518,7 +518,9 @@ class AMP(PPO):
         legacy_root_height = cfg["algorithm"].pop("amp_include_root_height", None)
         if legacy_root_height:
             raise ValueError("amp_include_root_height=True is incompatible with the unified AMP observation layout.")
-        quaternion_format = cfg["algorithm"].pop("motion_quaternion_format", "wxyz")
+        # Older configs exposed this as an override. Quaternion order now comes
+        # from the selected dataset contract (or variable-DOF file metadata).
+        cfg["algorithm"].pop("motion_quaternion_format", None)
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
         motion_files = cfg["algorithm"].pop("motion_files", None)
 
@@ -540,7 +542,6 @@ class AMP(PPO):
             key_body_names=key_body_names,
             body_names=body_names,
             joint_names=joint_names,
-            quaternion_format=quaternion_format,
             motion_file_pattern=motion_file_pattern,
             motion_files=motion_files,
             **dataset_options,
@@ -555,7 +556,6 @@ class AMP(PPO):
                 key_body_names=key_body_names,
                 body_names=body_names,
                 joint_names=joint_names,
-                quaternion_format=quaternion_format,
                 require_transitions=False,
                 **dataset_options,
             )

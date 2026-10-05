@@ -90,9 +90,9 @@ point. Legacy ``observation_profile`` is ignored.
 ``amp_include_root_height`` defaults to excluded; setting it to ``True`` is an error.
 Dimensions must match ``6 + joint_position_width + joint_velocity_width + 3 * key_point_count``.
 
-``motion_quaternion_format`` specifies the input file order and defaults to
-``"wxyz"`` for the BeyondMimic/SOMA NPZ contract. Set it to ``"xyzw"`` for
-files using that order; loading converts body quaternions to XYZW. Variable-DOF joint
-quaternion blocks are converted as well, and returned RSI metadata declares
-``quaternion_order="xyzw"``. Quaternions remain available for reference-state
-initialization although they are excluded from discriminator features.
+Input quaternion order follows the selected dataset: BeyondMimic uses WXYZ,
+SOMA uses XYZW, and variable-DOF records declare ``quaternion_order`` in each
+file. Dataset loaders convert body and joint quaternions to XYZW on input; RSI
+states and metadata also use XYZW. Quaternions remain available for
+reference-state initialization although they are excluded from discriminator
+features.
