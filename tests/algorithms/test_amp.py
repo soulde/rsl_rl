@@ -129,6 +129,38 @@ def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
     assert expert_dataset.sample_amp_observations(4).shape == (4, 26)
 
 
+def test_rsi_support_height_adjustment_is_cached_separately_from_motion_data(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    path = tmp_path / "walk.npz"
+    _write_soma_npz(path, frames=3)
+    with np.load(path) as archive:
+        payload = {key: archive[key] for key in archive.files}
+    body_pos = payload["body_pos_w"].copy()
+    for name in ("left_ankle_x_link", "right_ankle_x_link"):
+        body_pos[:, SOMA_TEST_BODY_NAMES.index(name), 2] = [0.03, 0.01, 0.15]
+    payload["body_pos_w"] = body_pos
+    np.savez(path, **payload)
+
+    dataset = SomaMotionDataset(
+        str(tmp_path), body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+    )
+    before = dataset.motions[0]["body_pos_w"].clone()
+    boxes = {
+        name: ((0.045, 0.0, -0.045), (0.3, 0.11, 0.06))
+        for name in ("left_ankle_x_link", "right_ankle_x_link")
+    }
+    dataset.configure_rsi_support_height_adjustment(boxes, 0.005)
+
+    torch.testing.assert_close(dataset.motions[0]["body_pos_w"], before)
+    offsets = dataset.motions[0]["root_height_offset"]
+    torch.testing.assert_close(offsets, torch.tensor([0.068, 0.07, 0.068]), atol=1e-5, rtol=0.0)
+    sampled = dataset.sample_reference_states(8)
+    assert sampled["root_height_offset"].shape == (8,)
+    assert sampled["root_height_velocity_offset"].shape == (8,)
+    assert not {"body_pos_w", "body_quat_xyzw", "body_lin_vel_w", "body_ang_vel_w"} & set(sampled)
+
+
 def test_motion_dataset_set_validate_filters_transitions_and_attaches_aligned_reset_fields(tmp_path):
     from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
 
@@ -171,7 +203,7 @@ def test_amp_rsi_sampler_prefers_separate_dataset_and_keeps_legacy_fallback():
     rsi_dataset = Dataset()
 
     assert _resolve_rsi_frame_sampler(expert_dataset, rsi_dataset)(3) == {"source": "rsi", "batch_size": 3}
-    assert _resolve_rsi_frame_sampler(expert_dataset)(2) == {"source": "expert", "batch_size": 2}
+    assert _resolve_rsi_frame_sampler(expert_dataset)(2) == {"source": "rsi", "batch_size": 2}
 
 
 def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp_path, monkeypatch):

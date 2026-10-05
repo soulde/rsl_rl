@@ -1,6 +1,6 @@
 """Simulator-independent RSI contract: XYZW quaternions and world-frame root velocities."""
 
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import torch
 
@@ -12,6 +12,8 @@ class RsiState(TypedDict):
     root_ang_vel: torch.Tensor
     joint_pos: torch.Tensor
     joint_vel: torch.Tensor
+    root_height_offset: NotRequired[torch.Tensor]
+    root_height_velocity_offset: NotRequired[torch.Tensor]
 
 
 class RsiJointLayout(TypedDict):
@@ -51,9 +53,17 @@ def reference_state(sample: dict, batch_size: int, layout: RsiJointLayout) -> Rs
     """Normalize loader output without filtering frames or solving physical constraints."""
     state = {name: sample[name] for name in ("root_pos", "root_lin_vel", "root_ang_vel", "joint_pos", "joint_vel")}
     state["root_quat"] = sample["root_quat_xyzw"]
+    for name in ("root_height_offset", "root_height_velocity_offset"):
+        if name in sample:
+            state[name] = sample[name]
+    if ("root_height_offset" in state) != ("root_height_velocity_offset" in state):
+        raise ValueError("RSI support correction must include height and vertical-velocity offsets together")
     dimensions = {"root_pos": 3, "root_quat": 4, "root_lin_vel": 3, "root_ang_vel": 3,
                   "joint_pos": layout["joint_pos_offsets"][-1], "joint_vel": layout["joint_vel_offsets"][-1]}
     for name, width in dimensions.items():
         if state[name].shape != (batch_size, width):
             raise ValueError(f"RSI {name} must have shape ({batch_size}, {width})")
+    for name in ("root_height_offset", "root_height_velocity_offset"):
+        if name in state and state[name].shape != (batch_size,):
+            raise ValueError(f"RSI {name} must have shape ({batch_size},)")
     return state
