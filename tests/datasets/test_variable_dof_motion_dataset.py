@@ -38,7 +38,6 @@ def load(path, **kwargs):
         str(path),
         joint_names=["ankle", "hip"],
         key_body_names=["ankle_point"],
-        quaternion_format="wxyz",
         amp_observation_dim=13,
         **kwargs,
     )
@@ -124,7 +123,6 @@ def test_ball_joint_features_have_distinct_position_velocity_widths(tmp_path):
         str(tmp_path),
         joint_names=["rod"],
         key_body_names=["ankle_point"],
-        quaternion_format="wxyz",
         amp_observation_dim=16,
     )
     assert dataset.sample_amp_observations(2).shape == (2, 32)

@@ -28,7 +28,9 @@ The loader reads this field and converts all loaded quaternions to XYZW.
 
 AMP features gather the configured ``joint_names`` in configuration order; a
 ball's four position coordinates and three velocity coordinates remain distinct.
-The root and body arrays retain the existing world-coordinate NPZ contract.
+The root and body arrays retain the existing world-coordinate NPZ contract. The
+file's ``quaternion_order`` declares body and joint quaternion order; the loader
+converts them to XYZW.
 ``key_body_names`` selects only points already present in ``body_names`` and the
 corresponding body arrays. Sites, synthetic points and MJCF parsing are not
 performed by this loader. Missing configured joints or points raise errors.

@@ -10,6 +10,8 @@ from .base_motion_dataset import BaseMotionDataset
 class SomaMotionDataset(BaseMotionDataset):
     """Load SOMA-retargeter NPZ files with explicit embedded contracts."""
 
+    input_quaternion_format = "xyzw"
+
     _REQUIRED_FIELDS = (
         "fps",
         "joint_pos",
@@ -41,5 +43,5 @@ class SomaMotionDataset(BaseMotionDataset):
         ):
             raise ValueError(f"SOMA motion {motion_file} body_names do not match configured body_names")
 
-        motion = self._tensor_motion(data, self.device, self.quaternion_format)
+        motion = self._tensor_motion(data, self.device, self.input_quaternion_format)
         return motion

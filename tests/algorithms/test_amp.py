@@ -46,7 +46,7 @@ def _write_soma_npz(path, *, joint_names=None, body_names=None, frames=3, zero_p
         joint_pos=joint_pos,
         joint_vel=np.zeros_like(joint_pos) if zero_pose else joint_pos + 100.0,
         body_pos_w=body_pos,
-        body_quat_w=np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (frames, len(body_names), 1)),
+        body_quat_w=np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (frames, len(body_names), 1)),
         body_lin_vel_w=np.zeros_like(body_pos),
         body_ang_vel_w=np.zeros_like(body_pos),
         joint_names=np.asarray(joint_names),
@@ -64,7 +64,7 @@ def test_soma_motion_dataset_requires_embedded_name_contract(tmp_path):
 
     with pytest.raises(ValueError, match="SOMA.*joint_names.*body_names"):
         SomaMotionDataset(
-            str(tmp_path), quaternion_format="wxyz", amp_observation_dim=13, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+            str(tmp_path), amp_observation_dim=13, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
         )
 
 
@@ -73,7 +73,7 @@ def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_fr
 
     _write_soma_npz(tmp_path / "walk.npz")
     dataset = SomaMotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
@@ -97,14 +97,14 @@ def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
     _write_soma_npz(expert_dir / "walk.npz", frames=3)
     _write_soma_npz(rsi_dir / "zero_pose.npz", frames=1, zero_pose=True)
     expert_dataset = SomaMotionDataset(
-        str(expert_dir), quaternion_format="wxyz",
+        str(expert_dir),
         amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
         joint_names=["joint_a", "joint_b"],
     )
     dataset = SomaMotionDataset(
-        str(rsi_dir), quaternion_format="wxyz",
+        str(rsi_dir),
         amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
@@ -134,7 +134,7 @@ def test_motion_dataset_set_validate_filters_transitions_and_attaches_aligned_re
 
     _write_soma_npz(tmp_path / "walk.npz", frames=3)
     dataset = SomaMotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
@@ -221,7 +221,6 @@ def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp
             "joint_names": ["joint_a", "joint_b"],
             "body_names": SOMA_TEST_BODY_NAMES,
             "key_body_names": ["left_ankle_x_link"],
-            "motion_quaternion_format": "wxyz",
             "reference_state_initialization": True,
         },
         "actor": {"class_name": "fake_model"},
@@ -244,7 +243,7 @@ def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp
     assert algorithm.kwargs["reference_state_initialization"] is True
 
 
-def test_motion_dataset_normalizes_body_order_and_quaternion_to_isaacsim(tmp_path):
+def test_soma_dataset_normalizes_body_order_and_keeps_xyzw_quaternion(tmp_path):
     from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
 
     source_body_names = list(reversed(SOMA_TEST_BODY_NAMES))
@@ -254,15 +253,15 @@ def test_motion_dataset_normalizes_body_order_and_quaternion_to_isaacsim(tmp_pat
     with np.load(tmp_path / "walk.npz") as data:
         payload = {key: data[key] for key in data.files}
     payload["body_pos_w"] = body_pos
-    # MuJoCo/GMR WXYZ (90 degrees around Z) must expose Isaac Sim XYZW.
+    # SOMA files use XYZW (90 degrees around Z); the loader keeps that contract.
     payload["body_quat_w"] = np.tile(
-        np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=np.float32),
+        np.array([0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)], dtype=np.float32),
         (3, len(source_body_names), 1),
     )
     np.savez(tmp_path / "walk.npz", **payload)
 
     dataset = SomaMotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
@@ -279,20 +278,16 @@ def test_motion_dataset_normalizes_body_order_and_quaternion_to_isaacsim(tmp_pat
     )
 
 
-def test_motion_dataset_accepts_xyzw_source_quaternions(tmp_path):
-    motion_path = tmp_path / "xyzw.npz"
-    np.savez(
-        motion_path,
-        fps=np.array([50]),
-        joint_pos=np.zeros((2, 1), dtype=np.float32),
-        joint_vel=np.zeros((2, 1), dtype=np.float32),
-        body_pos_w=np.zeros((2, 1, 3), dtype=np.float32),
-        body_quat_w=np.tile(np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32), (2, 1, 1)),
-        body_lin_vel_w=np.zeros((2, 1, 3), dtype=np.float32),
-        body_ang_vel_w=np.zeros((2, 1, 3), dtype=np.float32),
-    )
-    dataset = MotionDataset(str(tmp_path), amp_observation_dim=11, quaternion_format="xyzw")
-    assert torch.allclose(dataset.motions[0]["body_quat_xyzw"][0, 0], torch.tensor([0.0, 0.0, 0.0, 1.0]))
+def test_soma_dataset_uses_xyzw_input_format(tmp_path):
+    from rsl_rl.datasets.soma_motion_dataset import SomaMotionDataset
+
+    _write_soma_npz(tmp_path / "walk.npz", body_names=["base_link", "left_ankle_x_link"])
+    with np.load(tmp_path / "walk.npz") as data:
+        payload = {key: data[key] for key in data.files}
+    payload["body_quat_w"][:] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    np.savez(tmp_path / "walk.npz", **payload)
+    dataset = SomaMotionDataset(str(tmp_path))
+    assert torch.equal(dataset.motions[0]["body_quat_xyzw"][0, 0], torch.tensor([0.0, 0.0, 0.0, 1.0]))
 
 
 def test_soma_motion_dataset_rejects_body_name_mismatch(tmp_path):
@@ -304,7 +299,7 @@ def test_soma_motion_dataset_rejects_body_name_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="body_names"):
         SomaMotionDataset(
-            str(tmp_path), quaternion_format="wxyz", amp_observation_dim=13, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+            str(tmp_path), amp_observation_dim=13, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
         )
 
 
@@ -359,7 +354,7 @@ def test_motion_dataset_uses_external_body_names_and_root_orientation(tmp_path):
     )
 
     dataset = MotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         key_body_names=["foot"],
         body_names=["base", "foot"],
@@ -383,7 +378,7 @@ def test_motion_dataset_filters_npz_basenames_with_regex(tmp_path, capsys):
     np.savez(tmp_path / "debug_motion.npz", **payload)
 
     dataset = MotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         motion_file_pattern=r"walking_.*\.npz",
     )
@@ -408,7 +403,7 @@ def test_motion_dataset_selects_one_file_per_motion_kind_with_regex(tmp_path, ca
     np.savez(tmp_path / "7_WalkInClockwiseCircle10_stageii.npz", **payload)
 
     dataset = MotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         motion_file_pattern=r".*01_stageii\.npz",
     )
@@ -432,7 +427,7 @@ def test_motion_dataset_selects_explicit_file_list(tmp_path):
     np.savez(tmp_path / "debug.npz", **payload)
 
     dataset = MotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         motion_files=["turn_left01_stageii.npz", "run01_stageii.npz"],
     )
@@ -444,13 +439,13 @@ def test_motion_dataset_rejects_unknown_explicit_files(tmp_path):
     np.savez(tmp_path / "run01_stageii.npz", fps=np.array([50]))
 
     with pytest.raises(ValueError, match="motion_files not found"):
-        MotionDataset(str(tmp_path), quaternion_format="wxyz", motion_files=["missing.npz"])
+        MotionDataset(str(tmp_path), motion_files=["missing.npz"])
 
 
 def test_motion_dataset_rejects_pattern_and_list_together(tmp_path):
     with pytest.raises(ValueError, match="mutually exclusive"):
         MotionDataset(
-            str(tmp_path), quaternion_format="wxyz",
+            str(tmp_path),
             motion_file_pattern=r".*\.npz",
             motion_files=["run01_stageii.npz"],
         )
@@ -460,7 +455,7 @@ def test_motion_dataset_rejects_regex_without_matches(tmp_path):
     np.savez(tmp_path / "walking.npz", joint_pos=np.zeros((1, 1), dtype=np.float32))
 
     with pytest.raises(ValueError, match="matched no NPZ files"):
-        MotionDataset(str(tmp_path), quaternion_format="wxyz", motion_file_pattern=r"run_.*\.npz")
+        MotionDataset(str(tmp_path), motion_file_pattern=r"run_.*\.npz")
 
 
 def test_motion_dataset_uses_root_relative_world_axes_and_excludes_last_frame(tmp_path):
@@ -485,7 +480,7 @@ def test_motion_dataset_uses_root_relative_world_axes_and_excludes_last_frame(tm
     )
 
     dataset = MotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=11,
         key_body_names=["foot"],
         body_names=["base", "foot"],
@@ -512,7 +507,7 @@ def test_motion_dataset_preloads_vectorized_transitions(tmp_path):
     )
 
     dataset = MotionDataset(
-        str(tmp_path), quaternion_format="wxyz",
+        str(tmp_path),
         amp_observation_dim=13,
         key_body_names=["foot"],
         body_names=["base", "foot"],
@@ -554,7 +549,7 @@ def test_motion_dataset_rejects_joint_contract_mismatch(tmp_path):
     np.savez(tmp_path / "walk.npz", **payload)
 
     with pytest.raises(ValueError, match="joint contract"):
-        MotionDataset(str(tmp_path), quaternion_format="wxyz", joint_names=["joint_a"])
+        MotionDataset(str(tmp_path), joint_names=["joint_a"])
 
 
 def test_amp_transition_mask_excludes_terminated_environments():
