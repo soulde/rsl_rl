@@ -16,8 +16,8 @@ from .base_motion_dataset import BaseMotionDataset
 class VariableDofMotionDataset(BaseMotionDataset):
     """Select AMP and RSI coordinates independently by their joint names.
 
-    Joint quaternions remain WXYZ. Conversion to a simulator's convention belongs
-    at the state-write boundary. Key points must already exist in body arrays.
+    Body and joint quaternions are normalized to XYZW at load time.
+    Key points must already exist in body arrays.
     """
 
     reference_joint_pos_field = "rsi_joint_pos"
@@ -54,8 +54,9 @@ class VariableDofMotionDataset(BaseMotionDataset):
             raise ValueError(f"{motion_file}: missing fields {missing}")
         if str(data["schema_version"].item()) != "named-joints-v1":
             raise ValueError("Unsupported variable-DOF schema_version")
-        if str(data["quaternion_order"].item()) != "wxyz" or self.quaternion_format != "wxyz":
-            raise ValueError("named-joints-v1 quaternion order must be wxyz")
+        source_order = str(data["quaternion_order"].item())
+        if source_order not in {"wxyz", "xyzw"}:
+            raise ValueError("named-joints-v1 quaternion_order must be 'wxyz' or 'xyzw'")
         names = np.asarray(data["joint_names"]).tolist()
         types = np.asarray(data["joint_types"]).tolist()
         if not names or len(set(names)) != len(names):
@@ -116,6 +117,15 @@ class VariableDofMotionDataset(BaseMotionDataset):
             return np.concatenate([data[field][:, offsets[axis][i] : offsets[axis][i + 1]] for i in indices], axis=-1)
 
         selected = list(joint_names) if joint_names is not None else self.full_joint_names
+        if source_order == "wxyz":
+            # Convert each ball/free quaternion block before gathering AMP/RSI
+            # coordinates; scalar coordinates and velocity blocks stay intact.
+            data["joint_pos"] = data["joint_pos"].copy()
+            for index, kind in enumerate(types):
+                if kind in {"ball", "free"}:
+                    start = int(offsets[0][index]) + (3 if kind == "free" else 0)
+                    quaternion = data["joint_pos"][:, start : start + 4]
+                    data["joint_pos"][:, start : start + 4] = quaternion[:, [1, 2, 3, 0]]
         reference_names = self.rsi_joint_names if self.rsi_joint_names is not None else selected
         reference_types = [types[names.index(name)] for name in reference_names if name in names]
         # Validate names through the same decoder used for AMP, before building metadata.
@@ -129,7 +139,7 @@ class VariableDofMotionDataset(BaseMotionDataset):
         feature_data["joint_names"] = selected
         feature_data["joint_pos"] = coordinates(selected, "joint_pos", 0)
         feature_data["joint_vel"] = coordinates(selected, "joint_vel", 1)
-        motion = self._tensor_motion(feature_data, self.device, "wxyz")
+        motion = self._tensor_motion(feature_data, self.device, source_order)
         motion["rsi_joint_pos"] = torch.tensor(reference_pos, device=self.device, dtype=torch.float32)
         motion["rsi_joint_vel"] = torch.tensor(reference_vel, device=self.device, dtype=torch.float32)
         return motion
@@ -145,7 +155,7 @@ class VariableDofMotionDataset(BaseMotionDataset):
             joint_types=list(self.reference_joint_types),
             joint_pos_offsets=list(self.reference_pos_offsets),
             joint_vel_offsets=list(self.reference_vel_offsets),
-            quaternion_order="wxyz",
+            quaternion_order="xyzw",
         )
         return sampled
 

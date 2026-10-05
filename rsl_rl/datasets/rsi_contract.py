@@ -1,4 +1,4 @@
-"""Simulator-independent RSI contract: WXYZ quaternions and world-frame root velocities."""
+"""Simulator-independent RSI contract: XYZW quaternions and world-frame root velocities."""
 
 from typing import TypedDict
 
@@ -44,13 +44,13 @@ def reference_joint_layout(dataset) -> RsiJointLayout:
             raise ValueError("RSI joint offsets do not match joint types")
         offsets.append(supplied)
     return dict(joint_names=names, joint_types=types, joint_pos_offsets=offsets[0],
-                joint_vel_offsets=offsets[1], quaternion_order="wxyz")
+                joint_vel_offsets=offsets[1], quaternion_order="xyzw")
 
 
 def reference_state(sample: dict, batch_size: int, layout: RsiJointLayout) -> RsiState:
     """Normalize loader output without filtering frames or solving physical constraints."""
     state = {name: sample[name] for name in ("root_pos", "root_lin_vel", "root_ang_vel", "joint_pos", "joint_vel")}
-    state["root_quat"] = sample["root_quat_xyzw"][:, [3, 0, 1, 2]]
+    state["root_quat"] = sample["root_quat_xyzw"]
     dimensions = {"root_pos": 3, "root_quat": 4, "root_lin_vel": 3, "root_ang_vel": 3,
                   "joint_pos": layout["joint_pos_offsets"][-1], "joint_vel": layout["joint_vel_offsets"][-1]}
     for name, width in dimensions.items():
