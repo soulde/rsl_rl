@@ -17,7 +17,6 @@ class SomaMotionDataset(BaseMotionDataset):
         "joint_pos",
         "joint_vel",
         "body_pos_w",
-        "body_quat_w",
         "body_lin_vel_w",
         "body_ang_vel_w",
         "joint_names",
@@ -31,6 +30,11 @@ class SomaMotionDataset(BaseMotionDataset):
             raise ValueError(
                 f"SOMA motion {motion_file} is missing required fields: {', '.join(missing)}"
             )
+        quaternion_key = "body_quat_xyzw" if "body_quat_xyzw" in data else "body_quat_w"
+        if quaternion_key not in data:
+            raise ValueError(
+                f"SOMA motion {motion_file} is missing quaternion field 'body_quat_xyzw'"
+            )
 
         source_joint_names = [str(name) for name in np.asarray(data["joint_names"]).tolist()]
         source_body_names = [str(name) for name in np.asarray(data["body_names"]).tolist()]
@@ -43,5 +47,9 @@ class SomaMotionDataset(BaseMotionDataset):
         ):
             raise ValueError(f"SOMA motion {motion_file} body_names do not match configured body_names")
 
-        motion = self._tensor_motion(data, self.device, self.input_quaternion_format)
+        # Dataset type selects XYZW for SOMA. The explicit SOMA field is
+        # preferred; body_quat_w is accepted as a format-selected legacy alias.
+        tensor_data = {key: data[key] for key in data.files}
+        tensor_data["body_quat_w"] = tensor_data[quaternion_key]
+        motion = self._tensor_motion(tensor_data, self.device, self.input_quaternion_format)
         return motion
