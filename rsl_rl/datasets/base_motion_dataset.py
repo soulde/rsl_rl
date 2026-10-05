@@ -11,7 +11,12 @@ from abc import ABC, abstractmethod
 
 
 class BaseMotionDataset(ABC):
-    """Format-neutral AMP dataset pipeline for NPZ motion records."""
+    """NPZ motion pipeline with one world-axis AMP feature layout.
+
+    Features concatenate root linear/angular velocity, joint position/velocity,
+    and root-relative key-point positions, in that order. Loaded quaternions
+    use XYZW; ``quaternion_format`` describes the input file order.
+    """
 
     reference_joint_pos_field = "joint_pos"
     reference_joint_vel_field = "joint_vel"
@@ -20,9 +25,7 @@ class BaseMotionDataset(ABC):
         self,
         motion_dir: str,
         device: str = "cpu",
-        amp_observation_dim: int = 190,
-        include_root_height: bool = True,
-        observation_profile: str = "default",
+        amp_observation_dim: int | None = None,
         time_between_frames: float = 0.02,
         key_body_names: list[str] | None = None,
         body_names: list[str] | None = None,
@@ -34,10 +37,6 @@ class BaseMotionDataset(ABC):
     ):
         self.device = device
         self.amp_observation_dim = amp_observation_dim
-        self.include_root_height = include_root_height
-        self.observation_profile = observation_profile.lower()
-        if self.observation_profile not in {"default", "chocolate"}:
-            raise ValueError(f"Unknown AMP observation profile: {observation_profile!r}")
         self.time_between_frames = time_between_frames
         self.key_body_names = key_body_names
         self.joint_names = joint_names
@@ -90,8 +89,6 @@ class BaseMotionDataset(ABC):
                 raise ValueError(f"AMP key bodies are missing from motion body_names: {missing_key_bodies}")
             self.key_body_indices = [self.body_names.index(name) for name in self.key_body_names]
             print(f"[AMP] Key body indices: {self.key_body_indices}")
-        elif self.observation_profile == "chocolate":
-            raise ValueError("The chocolate AMP observation profile requires key_body_names and motion body_names")
 
         self.frame_indices = []
         self.reference_frame_indices = []
@@ -109,19 +106,13 @@ class BaseMotionDataset(ABC):
 
         num_bodies = self.motions[0]["body_pos_w"].shape[1]
         num_key_bodies = len(self.key_body_indices) if self.key_body_indices is not None else num_bodies
-        if self.observation_profile == "chocolate":
-            expected_dim = self.num_joints + self.motions[0]["joint_vel"].shape[-1] + num_key_bodies * 3 + 6
-        else:
-            expected_dim = (self.num_joints + self.motions[0]["joint_vel"].shape[-1]
-                            + num_key_bodies * 3 + 12 + int(self.include_root_height))
-        if self.amp_observation_dim != expected_dim:
-            if self.observation_profile == "chocolate":
-                raise ValueError(
-                    f"Chocolate AMP observation dimension is {self.amp_observation_dim}, "
-                    f"but motion features require {expected_dim}"
-                )
-            print(f"[AMP WARNING] amp_observation_dim={amp_observation_dim} != expected {expected_dim}")
-            print(f"  joints={self.num_joints}, key_bodies={num_key_bodies}")
+        expected_dim = self.num_joints + self.motions[0]["joint_vel"].shape[-1] + num_key_bodies * 3 + 6
+        if self.amp_observation_dim is None:
+            self.amp_observation_dim = expected_dim
+        elif self.amp_observation_dim != expected_dim:
+            raise ValueError(
+                f"AMP observation dimension is {self.amp_observation_dim}, but motion features require {expected_dim}"
+            )
 
         observations = [self._all_observations(motion).to(device) for motion in self.motions]
         self._motion_observation_dim = observations[0].shape[-1]
@@ -170,9 +161,8 @@ class BaseMotionDataset(ABC):
             "joint_pos": torch.tensor(data["joint_pos"], dtype=torch.float32, device=device),
             "joint_vel": torch.tensor(data["joint_vel"], dtype=torch.float32, device=device),
             "body_pos_w": torch.tensor(data["body_pos_w"], dtype=torch.float32, device=device),
-            # Keep the source field for compatibility and expose the Isaac
-            # Sim XYZW contract explicitly for consumers that need quaternions.
-            "body_quat_w": body_quat,
+            # All loaded body quaternions use XYZW, independently of file order.
+            "body_quat_w": body_quat_xyzw,
             "body_quat_xyzw": body_quat_xyzw,
             "body_lin_vel_w": torch.tensor(data["body_lin_vel_w"], dtype=torch.float32, device=device),
             "body_ang_vel_w": torch.tensor(data["body_ang_vel_w"], dtype=torch.float32, device=device),
@@ -398,31 +388,11 @@ class BaseMotionDataset(ABC):
             key_body_pos = motion["body_pos_w"][:, self.key_body_indices, :]
         else:
             key_body_pos = motion["body_pos_w"]
-        # Isaac Sim AMP observations use rotation matrices; the source
-        # quaternions have already been normalized to the explicit XYZW field.
-        root_rotation = _quat_xyzw_to_matrix_batch(motion["body_quat_xyzw"][:, 0])
-        body_offsets = key_body_pos - root_pos
-        body_pos_relative = torch.matmul(
-            root_rotation.transpose(-1, -2), body_offsets.transpose(-1, -2)
-        ).transpose(-1, -2).flatten(start_dim=1)
-        if self.observation_profile == "chocolate":
-            root_lin_vel_local = torch.matmul(root_rotation.transpose(-1, -2), motion["body_lin_vel_w"][:, 0, :, None])
-            root_ang_vel_local = torch.matmul(root_rotation.transpose(-1, -2), motion["body_ang_vel_w"][:, 0, :, None])
-            return torch.cat(
-                [
-                    joint_pos,
-                    body_pos_relative,
-                    root_lin_vel_local.squeeze(-1),
-                    root_ang_vel_local.squeeze(-1),
-                    joint_vel,
-                ],
-                dim=-1,
-            )
-        root_orientation = root_rotation[..., :2, :].reshape(len(joint_pos), -1)
+        # Features use world axes. Positions are relative to the root,
+        # while velocities are absolute velocities expressed in world axes.
+        body_pos_relative = (key_body_pos - root_pos).flatten(start_dim=1)
         return torch.cat(
             [
-                *([root_pos[:, 0, 2:3]] if self.include_root_height else []),
-                root_orientation,
                 motion["body_lin_vel_w"][:, 0],
                 motion["body_ang_vel_w"][:, 0],
                 joint_pos,
@@ -434,16 +404,3 @@ class BaseMotionDataset(ABC):
 
     def __len__(self):
         return len(self.frame_indices)
-
-
-def _quat_xyzw_to_matrix_batch(quaternion: torch.Tensor) -> torch.Tensor:
-    quaternion = quaternion / quaternion.norm(dim=-1, keepdim=True).clamp_min(1.0e-8)
-    x, y, z, w = quaternion.unbind(-1)
-    return torch.stack(
-        (
-            1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
-            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
-            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
-        ),
-        dim=-1,
-    ).reshape(*quaternion.shape[:-1], 3, 3)

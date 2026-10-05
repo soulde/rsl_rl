@@ -38,7 +38,7 @@ def load(path, **kwargs):
         str(path),
         joint_names=["ankle", "hip"],
         key_body_names=["ankle_point"],
-        observation_profile="chocolate",
+        quaternion_format="wxyz",
         amp_observation_dim=13,
         **kwargs,
     )
@@ -47,20 +47,40 @@ def load(path, **kwargs):
 def test_selects_feature_slices_and_samples_complete_joint_state(tmp_path):
     write_motion(tmp_path / "motion.npz")
     dataset = load(tmp_path)
-    torch.testing.assert_close(dataset.transitions[0, :2], torch.tensor([2.0, 1.0]))
-    torch.testing.assert_close(dataset.transitions[0, 2:5], torch.tensor([0.0, 0.0, -1.0]))
-    torch.testing.assert_close(dataset.transitions[0, 11:13], torch.tensor([15.0, 11.0]))
+    torch.testing.assert_close(dataset.transitions[0, 6:8], torch.tensor([2.0, 1.0]))
+    torch.testing.assert_close(dataset.transitions[0, 10:13], torch.tensor([0.0, 0.0, -1.0]))
+    torch.testing.assert_close(dataset.transitions[0, 8:10], torch.tensor([15.0, 11.0]))
     dataset.set_validate(torch.tensor([True, False]), {"extra": [torch.arange(3.0)[:, None]]})
     sample = dataset.sample_reference_frames(4)
     assert sample["joint_names"] == ["hip", "rod", "ankle"]
     assert sample["joint_types"] == ["hinge", "ball", "hinge"]
     assert sample["joint_pos_offsets"] == [0, 1, 5, 6]
     assert sample["joint_vel_offsets"] == [0, 1, 4, 5]
-    assert sample["quaternion_order"] == "wxyz"
-    torch.testing.assert_close(sample["joint_pos"], torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0, 2.0]]).repeat(4, 1))
+    assert sample["quaternion_order"] == "xyzw"
+    torch.testing.assert_close(sample["joint_pos"], torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 2.0]]).repeat(4, 1))
     assert sample["extra"].shape == (4, 1)
     assert dataset.sample_reference_frames(0)["joint_pos"].shape == (0, 6)
     assert dataset.sample_amp_observations(4).shape == (4, 26)
+
+
+def test_declared_xyzw_joint_quaternions_stay_xyzw_in_amp_and_rsi(tmp_path):
+    write_motion(
+        tmp_path / "motion.npz",
+        quaternion_order=np.array("xyzw"),
+        joint_pos=np.array(
+            [[1, 0, 0, 0, 1, 2], [3, 0, 0, 0, 1, 4], [5, 0, 0, 0, 1, 6]],
+            dtype=np.float32,
+        ),
+        body_quat_w=np.tile(np.array([0, 0, 0, 1], dtype=np.float32), (3, 2, 1)),
+    )
+    dataset = load(tmp_path)
+    assert dataset.motions[0]["body_quat_xyzw"][0, 0].tolist() == [0, 0, 0, 1]
+    sample = dataset.sample_reference_frames(2)
+    assert sample["quaternion_order"] == "xyzw"
+    torch.testing.assert_close(sample["joint_pos"][:, 1:5], torch.tensor([[0, 0, 0, 1]], dtype=torch.float32).repeat(2, 1))
+    assert set(sample["joint_pos"][:, 0].tolist()) <= {1.0, 3.0, 5.0}
+    assert set(sample["joint_pos"][:, 5].tolist()) <= {2.0, 4.0, 6.0}
+    assert sample["amp_obs"].shape == (2, 13)
 
 
 def test_single_frame_rsi_uses_same_full_state_decoder(tmp_path):
@@ -80,7 +100,7 @@ def test_single_frame_rsi_uses_same_full_state_decoder(tmp_path):
         ({"joint_names": np.array(["hip", "hip", "ankle"])}, "duplicate"),
         ({"joint_types": np.array(["hinge", "unknown", "hinge"])}, "type"),
         ({"joint_vel": np.zeros((2, 5))}, "frame"),
-        ({"quaternion_order": np.array("xyzw")}, "quaternion"),
+        ({"quaternion_order": np.array("invalid")}, "quaternion"),
         ({"fps": np.float32(0)}, "fps"),
         ({"joint_pos": np.full((3, 6), np.nan)}, "finite"),
     ],
@@ -104,7 +124,7 @@ def test_ball_joint_features_have_distinct_position_velocity_widths(tmp_path):
         str(tmp_path),
         joint_names=["rod"],
         key_body_names=["ankle_point"],
-        observation_profile="chocolate",
+        quaternion_format="wxyz",
         amp_observation_dim=16,
     )
     assert dataset.sample_amp_observations(2).shape == (2, 32)
@@ -124,9 +144,9 @@ def test_joint_blocks_reorder_consistently_between_files(tmp_path):
     dataset = load(tmp_path)
     dataset.set_validate(torch.tensor([False, False, True, False]))
     sampled = dataset.sample_reference_frames(1)
-    torch.testing.assert_close(sampled["joint_pos"], torch.tensor([[1.0, 1.0, 0.0, 0.0, 0.0, 2.0]]))
+    torch.testing.assert_close(sampled["joint_pos"], torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 2.0]]))
     torch.testing.assert_close(sampled["joint_vel"], torch.tensor([[11.0, 12.0, 13.0, 14.0, 15.0]]))
-    torch.testing.assert_close(sampled["amp_obs"][:, :2], torch.tensor([[2.0, 1.0]]))
+    torch.testing.assert_close(sampled["amp_obs"][:, 6:8], torch.tensor([[2.0, 1.0]]))
 
 
 def test_missing_selected_joint_is_rejected(tmp_path):
@@ -147,12 +167,12 @@ def test_rsi_selection_is_independent_and_none_defaults_to_amp(tmp_path, selecti
     dataset = load(tmp_path, rsi_joint_names=selection)
     dataset.set_validate(torch.tensor([True, False]))
     sample = dataset.sample_reference_frames(1)
-    torch.testing.assert_close(sample["amp_obs"][:, :2], torch.tensor([[2.0, 1.0]]))
+    torch.testing.assert_close(sample["amp_obs"][:, 6:8], torch.tensor([[2.0, 1.0]]))
     if selection:
         assert sample["joint_names"] == ["rod", "hip"]
         assert sample["joint_pos_offsets"] == [0, 4, 5]
         assert sample["joint_vel_offsets"] == [0, 3, 4]
-        torch.testing.assert_close(sample["joint_pos"], torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0]]))
+        torch.testing.assert_close(sample["joint_pos"], torch.tensor([[0.0, 0.0, 0.0, 1.0, 1.0]]))
         torch.testing.assert_close(sample["joint_vel"], torch.tensor([[12.0, 13.0, 14.0, 11.0]]))
     else:
         assert sample["joint_names"] == ["ankle", "hip"]

@@ -12,13 +12,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections.abc import Callable
 from typing import Any
+import warnings
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
 from rsl_rl.datasets.rsi_contract import RsiJointLayout, RsiState, reference_joint_layout, reference_state
 from rsl_rl.extensions import resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
-from rsl_rl.modules import MLP, EmpiricalNormalization
+from rsl_rl.modules import MLP
+from rsl_rl.modules.distribution import GaussianDistribution
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_callable, resolve_obs_groups
 
@@ -112,6 +114,39 @@ class AmpReplayBuffer:
             self.position = min(self.position, self.size)
 
 
+class AmpNormalizer(nn.Module):
+    """AMP-Go2 running moments with clipped normalization and checkpoint buffers."""
+
+    def __init__(self, observation_dim: int):
+        super().__init__()
+        self.register_buffer("_mean", torch.zeros(1, observation_dim, dtype=torch.float64))
+        self.register_buffer("_var", torch.ones(1, observation_dim, dtype=torch.float64))
+        self.register_buffer("_std", torch.ones(1, observation_dim, dtype=torch.float64))
+        self.register_buffer("count", torch.tensor(1.0e-4, dtype=torch.float64))
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        mean = self._mean.to(observations.dtype)
+        std = (self._var + 1.0e-4).to(observations.dtype).sqrt()
+        return ((observations - mean) / std).clamp(-10.0, 10.0)
+
+    @torch.no_grad()
+    def update(self, observations: torch.Tensor) -> None:
+        if not self.training or observations.shape[0] == 0:
+            return
+        observations = observations.to(dtype=torch.float64, device=self._mean.device)
+        batch_count = observations.shape[0]
+        batch_mean = observations.mean(dim=0, keepdim=True)
+        batch_var = observations.var(dim=0, unbiased=False, keepdim=True)
+        delta = batch_mean - self._mean
+        total_count = self.count + batch_count
+        second_moment = self._var * self.count + batch_var * batch_count
+        second_moment += delta.square() * self.count * batch_count / total_count
+        self._mean.add_(delta * batch_count / total_count)
+        self._var.copy_(second_moment / total_count)
+        self._std.copy_(self._var.sqrt())
+        self.count.copy_(total_count)
+
+
 class AMP(PPO):
     """PPO with an AMP discriminator and style-reward mixing."""
 
@@ -126,17 +161,20 @@ class AMP(PPO):
         reference_frame_sampler: Callable[[int], dict[str, torch.Tensor]] | None = None,
         reference_state_initialization: bool = False,
         discriminator_hidden_dims: tuple[int, ...] | list[int] = (1024, 512),
-        discriminator_activation: str = "relu",
-        discriminator_learning_rate: float = 5.0e-4,
-        discriminator_batch_size: int = 4096,
-        discriminator_updates: int = 4,
-        discriminator_loss_scale: float = 5.0,
-        discriminator_logit_regularization_scale: float = 0.05,
-        discriminator_gradient_penalty_scale: float = 5.0,
+        discriminator_activation: str = "lrelu",
+        discriminator_learning_rate: float | None = None,
+        discriminator_batch_size: int | None = None,
+        discriminator_updates: int | None = None,
+        discriminator_loss_scale: float = 1.0,
+        discriminator_logit_regularization_scale: float = 0.0,
+        discriminator_gradient_penalty_scale: float = 10.0,
         discriminator_weight_decay_scale: float = 0.0,
-        amp_replay_buffer_size: int = 200_000,
-        task_reward_scale: float = 0.0,
-        style_reward_scale: float = 1.0,
+        amp_replay_buffer_size: int = 100_000,
+        task_reward_scale: float | None = None,
+        style_reward_scale: float | None = None,
+        amp_reward_coef: float = 0.2,
+        task_reward_lerp: float | None = None,
+        min_std: float | list[float] | torch.Tensor | None = None,
         reference_motion_dataset: Any | None = None,
         **kwargs,
     ):
@@ -146,15 +184,48 @@ class AMP(PPO):
         self._reference_frame_sampler = reference_frame_sampler
         self.reference_motion_dataset = reference_motion_dataset
         self.reference_state_initialization = reference_state_initialization
-        self.discriminator_batch_size = discriminator_batch_size
-        self.discriminator_updates = discriminator_updates
+        self.discriminator_batch_size = storage.num_envs * storage.num_transitions_per_env // self.num_mini_batches
+        self.discriminator_updates = self.num_learning_epochs * self.num_mini_batches
+        legacy_settings = (
+            ("discriminator_learning_rate", discriminator_learning_rate, self.learning_rate),
+            ("discriminator_batch_size", discriminator_batch_size, self.discriminator_batch_size),
+            ("discriminator_updates", discriminator_updates, self.discriminator_updates),
+        )
+        for name, configured, effective in legacy_settings:
+            if configured is not None and configured != effective:
+                warnings.warn(
+                    f"{name}={configured} is ignored by AMP-Go2 semantics; effective value is {effective} "
+                    "and follows PPO's optimizer/minibatches.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
         self.discriminator_loss_scale = discriminator_loss_scale
         self.discriminator_logit_regularization_scale = discriminator_logit_regularization_scale
         self.discriminator_gradient_penalty_scale = discriminator_gradient_penalty_scale
         self.discriminator_weight_decay_scale = discriminator_weight_decay_scale
         self.amp_state_dim = amp_observation_dim
-        self.task_reward_scale = task_reward_scale
-        self.style_reward_scale = style_reward_scale
+        if task_reward_lerp is not None and (task_reward_scale is not None or style_reward_scale is not None):
+            raise ValueError("Use task_reward_lerp/amp_reward_coef or legacy reward scales, not both.")
+        if task_reward_lerp is None:
+            task_reward_lerp = 0.0 if task_reward_scale is None else task_reward_scale
+            if style_reward_scale is not None:
+                if task_reward_lerp >= 1.0 and style_reward_scale != 0.0:
+                    raise ValueError("Legacy style_reward_scale must be zero when task_reward_scale is one.")
+                amp_reward_coef = style_reward_scale / (1.0 - task_reward_lerp) if task_reward_lerp < 1.0 else 0.0
+        if not 0.0 <= task_reward_lerp <= 1.0 or amp_reward_coef < 0.0:
+            raise ValueError("AMP requires task_reward_lerp in [0, 1] and a non-negative amp_reward_coef.")
+        self.task_reward_lerp = task_reward_lerp
+        self.amp_reward_coef = amp_reward_coef
+        self.min_std = None if min_std is None else torch.as_tensor(min_std, device=self.device)
+        if self.min_std is not None:
+            if not isinstance(self._raw_actor.distribution, GaussianDistribution):
+                raise ValueError("AMP min_std requires a state-independent Gaussian actor distribution.")
+            distribution = self._raw_actor.distribution
+            std_parameter = distribution.std_param if distribution.std_type == "scalar" else distribution.log_std_param
+            if self.min_std.ndim > 1 or self.min_std.numel() not in (1, std_parameter.numel()):
+                raise ValueError("AMP min_std must be a scalar or one value per action.")
+            if not torch.all(torch.isfinite(self.min_std) & (self.min_std > 0.0)):
+                raise ValueError("AMP min_std must be positive.")
 
         self.discriminator = MLP(
             2 * self.amp_state_dim,
@@ -183,16 +254,15 @@ class AMP(PPO):
                 "name": "amp_head",
             }
         )
-        # One shared scaler is updated from policy/replay/expert states and is
-        # applied independently to both sides of every transition.
-        self.amp_normalizer = EmpiricalNormalization(self.amp_state_dim).to(self.device)
+        # Normalize both sides using the same moments. Update moments from
+        # policy/expert current states after each optimizer step, as AMP-Go2 does.
+        self.amp_normalizer = AmpNormalizer(self.amp_state_dim).to(self.device)
         self.amp_replay_buffer = AmpReplayBuffer(
             amp_replay_buffer_size,
             2 * self.amp_state_dim,
             self.device,
         )
-        self._rollout_amp_transitions: list[torch.Tensor] = []
-        self._amp_update_online: torch.Tensor | None = None
+        self._amp_normalizer_samples: tuple[torch.Tensor, torch.Tensor] | None = None
         self._current_amp_observations: torch.Tensor | None = None
         self.style_rewards = torch.zeros(1, device=self.device)
 
@@ -247,9 +317,22 @@ class AMP(PPO):
                     [final_obs[group] for group in self.amp_observation_groups],
                     dim=-1,
                 )
+        done_mask = dones.to(self.device).bool().reshape(-1)
+        if terminal_amp_observations is None and done_mask.any():
+            raise ValueError(
+                "AMP-Go2 terminal transitions require pre-reset AMP states. Provide "
+                "extras['terminal_amp_observations'] or extras['final_obs']; "
+                "enable compute_final_obs in auto-reset environments."
+            )
         if terminal_amp_observations is not None:
-            done_mask = dones.bool()
-            next_amp_observations[done_mask] = terminal_amp_observations.to(self.device)[done_mask]
+            terminal_amp_observations = terminal_amp_observations.to(self.device)
+            if terminal_amp_observations.shape == next_amp_observations.shape:
+                terminal_states = terminal_amp_observations[done_mask]
+            elif terminal_amp_observations.shape == (int(done_mask.sum().item()), self.amp_state_dim):
+                terminal_states = terminal_amp_observations
+            else:
+                raise ValueError("terminal_amp_observations must contain all environments or done environments in mask order.")
+            next_amp_observations[done_mask] = terminal_states
 
         amp_transitions = torch.cat(
             (self._current_amp_observations, next_amp_observations),
@@ -261,14 +344,14 @@ class AMP(PPO):
             # so reward and train on them as Chocolate AMP does.
             valid_mask = torch.ones_like(valid_mask)
         if valid_mask.any():
-            self._rollout_amp_transitions.append(amp_transitions[valid_mask])
+            self.amp_replay_buffer.add(amp_transitions[valid_mask])
         with torch.no_grad():
             predictions = self.discriminator(self._normalize_amp_transitions(amp_transitions))
-            self.style_rewards = compute_amp_reward(predictions).squeeze(-1)
+            self.style_rewards = self.amp_reward_coef * compute_amp_reward(predictions).squeeze(-1)
             self.style_rewards = self.style_rewards.masked_fill(~valid_mask, 0.0)
             combined_rewards = (
-                self.task_reward_scale * rewards
-                + self.style_reward_scale * self.style_rewards
+                self.task_reward_lerp * rewards
+                + (1.0 - self.task_reward_lerp) * self.style_rewards
             )
         extras["amp_style_reward"] = self.style_rewards.mean()
         extras["amp_task_reward"] = rewards.mean()
@@ -276,52 +359,33 @@ class AMP(PPO):
         self._current_amp_observations = None
 
     def update(self) -> dict[str, float]:
-        online = torch.cat(self._rollout_amp_transitions, dim=0) if self._rollout_amp_transitions else None
-        self._rollout_amp_transitions.clear()
-        self._amp_update_online = online
+        self._amp_normalizer_samples = None
         try:
             losses = super().update()
         finally:
-            self._amp_update_online = None
-        if online is not None:
-            self.amp_replay_buffer.add(online)
+            self._amp_normalizer_samples = None
         losses["amp_style_reward"] = self.style_rewards.mean().item()
         return losses
 
     def _compute_auxiliary_loss(
         self, batch, original_batch_size: int
     ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
-        online = self._amp_update_online
-        if online is None or online.shape[0] == 0:
+        if self.amp_replay_buffer.size == 0:
             return None, {}
 
         # AMP-Go samples one discriminator minibatch alongside every PPO
         # minibatch, using the PPO minibatch size for both streams.
-        batch_size = original_batch_size
-        indexes = torch.randint(online.shape[0], (batch_size,), device=online.device)
-        policy_samples = online[indexes]
-        replay_samples = (
-            self.amp_replay_buffer.sample(batch_size)
-            if self.amp_replay_buffer.size > 0
-            else policy_samples
-        )
+        batch_size = self.discriminator_batch_size
+        policy_samples = self.amp_replay_buffer.sample(batch_size)
         expert_samples = self.collect_reference_motions(batch_size).to(self.device)
-
-        with torch.no_grad():
-            states = torch.cat(
-                (
-                    *policy_samples.split(self.amp_state_dim, dim=-1),
-                    *replay_samples.split(self.amp_state_dim, dim=-1),
-                    *expert_samples.split(self.amp_state_dim, dim=-1),
-                ),
-                dim=0,
-            )
-            self.amp_normalizer.update(states)
+        self._amp_normalizer_samples = (
+            policy_samples[:, :self.amp_state_dim].detach(),
+            expert_samples[:, :self.amp_state_dim].detach(),
+        )
         policy_samples = self._normalize_amp_transitions(policy_samples)
-        replay_samples = self._normalize_amp_transitions(replay_samples)
         expert_samples = self._normalize_amp_transitions(expert_samples).requires_grad_(True)
 
-        policy_predictions = self.discriminator(torch.cat((policy_samples, replay_samples), dim=0))
+        policy_predictions = self.discriminator(policy_samples)
         expert_predictions = self.discriminator(expert_samples)
         prediction_loss = 0.5 * (
             F.mse_loss(policy_predictions, -torch.ones_like(policy_predictions))
@@ -350,7 +414,31 @@ class AMP(PPO):
             "amp_discriminator": loss.detach(),
             "amp_prediction": prediction_loss.detach(),
             "amp_gradient_penalty": gradient_penalty.detach(),
+            "amp_policy_prediction": policy_predictions.mean().detach(),
+            "amp_expert_prediction": expert_predictions.mean().detach(),
         }
+
+    def _clip_gradients(self) -> None:
+        """AMP-Go2 clips mean-network/critic gradients, leaving std and discriminator untouched."""
+        distribution = self._raw_actor.distribution
+        distribution_parameters = set() if distribution is None else {id(p) for p in distribution.parameters()}
+        actor_parameters = [p for p in self.actor.parameters() if id(p) not in distribution_parameters]
+        nn.utils.clip_grad_norm_(actor_parameters, self.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+
+    def _after_optimizer_step(self) -> None:
+        """Match reference std clamping and post-step current-state moment updates."""
+        with torch.no_grad():
+            if self.min_std is not None:
+                distribution = self._raw_actor.distribution
+                if distribution.std_type == "scalar":
+                    distribution.std_param.copy_(torch.maximum(distribution.std_param, self.min_std))
+                else:
+                    distribution.log_std_param.copy_(torch.maximum(distribution.log_std_param, self.min_std.log()))
+        if self._amp_normalizer_samples is not None:
+            for states in self._amp_normalizer_samples:
+                self.amp_normalizer.update(states)
+            self._amp_normalizer_samples = None
 
     def train_mode(self) -> None:
         super().train_mode()
@@ -420,8 +508,16 @@ class AMP(PPO):
         key_body_names = cfg["algorithm"].pop("key_body_names", None)
         body_names = cfg["algorithm"].pop("body_names", None)
         joint_names = cfg["algorithm"].pop("joint_names", None)
-        include_root_height = cfg["algorithm"].pop("amp_include_root_height", True)
-        observation_profile = cfg["algorithm"].pop("observation_profile", "default")
+        legacy_profile = cfg["algorithm"].pop("observation_profile", None)
+        if legacy_profile is not None:
+            warnings.warn(
+                "'observation_profile' is deprecated and ignored; AMP motion observations now use one layout.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        legacy_root_height = cfg["algorithm"].pop("amp_include_root_height", None)
+        if legacy_root_height:
+            raise ValueError("amp_include_root_height=True is incompatible with the unified AMP observation layout.")
         quaternion_format = cfg["algorithm"].pop("motion_quaternion_format", "wxyz")
         motion_file_pattern = cfg["algorithm"].pop("motion_file_pattern", None)
         motion_files = cfg["algorithm"].pop("motion_files", None)
@@ -440,8 +536,6 @@ class AMP(PPO):
             motion_dir=motion_dir,
             device=device,
             amp_observation_dim=amp_dim,
-            include_root_height=include_root_height,
-            observation_profile=observation_profile,
             time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
             key_body_names=key_body_names,
             body_names=body_names,
@@ -457,8 +551,6 @@ class AMP(PPO):
                 motion_dir=rsi_motion_dir,
                 device=device,
                 amp_observation_dim=amp_dim,
-                include_root_height=include_root_height,
-                observation_profile=observation_profile,
                 time_between_frames=env.unwrapped.cfg.sim.dt * env.unwrapped.cfg.decimation,
                 key_body_names=key_body_names,
                 body_names=body_names,
@@ -471,20 +563,23 @@ class AMP(PPO):
         # Extract AMP-specific parameters from config
         amp_params = {
             "discriminator_hidden_dims": cfg["algorithm"].pop("discriminator_hidden_dims", (1024, 512)),
-            "discriminator_activation": cfg["algorithm"].pop("discriminator_activation", "relu"),
-            "discriminator_learning_rate": cfg["algorithm"].pop("discriminator_learning_rate", 5e-4),
-            "discriminator_batch_size": cfg["algorithm"].pop("discriminator_batch_size", 4096),
-            "discriminator_updates": cfg["algorithm"].pop("discriminator_updates", 4),
-            "discriminator_loss_scale": cfg["algorithm"].pop("discriminator_loss_scale", 5.0),
+            "discriminator_activation": cfg["algorithm"].pop("discriminator_activation", "lrelu"),
+            "discriminator_learning_rate": cfg["algorithm"].pop("discriminator_learning_rate", None),
+            "discriminator_batch_size": cfg["algorithm"].pop("discriminator_batch_size", None),
+            "discriminator_updates": cfg["algorithm"].pop("discriminator_updates", None),
+            "discriminator_loss_scale": cfg["algorithm"].pop("discriminator_loss_scale", 1.0),
             "discriminator_logit_regularization_scale": cfg["algorithm"].pop(
-                "discriminator_logit_regularization_scale", 0.05
+                "discriminator_logit_regularization_scale", 0.0
             ),
-            "discriminator_gradient_penalty_scale": cfg["algorithm"].pop("discriminator_gradient_penalty_scale", 5.0),
+            "discriminator_gradient_penalty_scale": cfg["algorithm"].pop("discriminator_gradient_penalty_scale", 10.0),
             "discriminator_weight_decay_scale": cfg["algorithm"].pop("discriminator_weight_decay_scale", 0.0),
-            "amp_replay_buffer_size": cfg["algorithm"].pop("amp_replay_buffer_size", 200000),
+            "amp_replay_buffer_size": cfg["algorithm"].pop("amp_replay_buffer_size", 100000),
             "reference_state_initialization": reference_state_initialization,
-            "task_reward_scale": cfg["algorithm"].pop("task_reward_scale", 0.0),
-            "style_reward_scale": cfg["algorithm"].pop("style_reward_scale", 1.0),
+            "task_reward_scale": cfg["algorithm"].pop("task_reward_scale", None),
+            "style_reward_scale": cfg["algorithm"].pop("style_reward_scale", None),
+            "amp_reward_coef": cfg["algorithm"].pop("amp_reward_coef", 0.2),
+            "task_reward_lerp": cfg["algorithm"].pop("task_reward_lerp", None),
+            "min_std": cfg["algorithm"].pop("min_std", None),
         }
 
         return alg_class(

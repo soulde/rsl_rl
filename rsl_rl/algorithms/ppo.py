@@ -65,6 +65,7 @@ class PPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         grad_reduce_bucket_mb: float = 25,
+        min_learning_rate: float = 1.0e-5,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -114,6 +115,9 @@ class PPO:
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
+        if min_learning_rate <= 0.0:
+            raise ValueError("min_learning_rate must be positive.")
+        self.min_learning_rate = min_learning_rate
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -252,7 +256,7 @@ class PPO:
                         # Update the learning rate only on the main process
                         if self.gpu_global_rank == 0:
                             if kl_mean > self.desired_kl * 2.0:
-                                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                                self.learning_rate = max(self.min_learning_rate, self.learning_rate / 1.5)
                             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                                 self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
@@ -315,9 +319,9 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self._clip_gradients()
             self.optimizer.step()
+            self._after_optimizer_step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -371,6 +375,15 @@ class PPO:
     def _compute_auxiliary_loss(self, batch, original_batch_size: int) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
         """Return an optional loss and metrics to include in each PPO minibatch step."""
         return None, {}
+
+    def _after_optimizer_step(self) -> None:
+        """Update auxiliary state after each optimizer step."""
+        pass
+
+    def _clip_gradients(self) -> None:
+        """Clip actor and critic gradients independently."""
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

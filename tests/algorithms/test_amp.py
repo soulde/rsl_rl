@@ -64,7 +64,7 @@ def test_soma_motion_dataset_requires_embedded_name_contract(tmp_path):
 
     with pytest.raises(ValueError, match="SOMA.*joint_names.*body_names"):
         SomaMotionDataset(
-            str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+            str(tmp_path), quaternion_format="wxyz", amp_observation_dim=13, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
         )
 
 
@@ -73,8 +73,8 @@ def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_fr
 
     _write_soma_npz(tmp_path / "walk.npz")
     dataset = SomaMotionDataset(
-        str(tmp_path),
-        amp_observation_dim=20,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
         joint_names=["joint_a", "joint_b"],
@@ -84,7 +84,7 @@ def test_soma_motion_dataset_accepts_configured_body_order_and_keeps_adjacent_fr
     assert dataset.motions[0]["fps"] == 50.0
     assert torch.equal(dataset.motions[0]["joint_pos"][:, 0], torch.tensor([0.0, 2.0, 4.0]))
     assert torch.equal(dataset.motions[0]["joint_vel"][:, 1], torch.tensor([101.0, 103.0, 105.0]))
-    assert torch.equal(dataset.transitions[:, 13].sort().values, torch.tensor([0.0, 2.0]))
+    assert torch.equal(dataset.transitions[:, 6].sort().values, torch.tensor([0.0, 2.0]))
 
 
 def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
@@ -97,15 +97,15 @@ def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
     _write_soma_npz(expert_dir / "walk.npz", frames=3)
     _write_soma_npz(rsi_dir / "zero_pose.npz", frames=1, zero_pose=True)
     expert_dataset = SomaMotionDataset(
-        str(expert_dir),
-        amp_observation_dim=20,
+        str(expert_dir), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
         joint_names=["joint_a", "joint_b"],
     )
     dataset = SomaMotionDataset(
-        str(rsi_dir),
-        amp_observation_dim=20,
+        str(rsi_dir), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
         joint_names=["joint_a", "joint_b"],
@@ -114,7 +114,7 @@ def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
 
     sampled = dataset.sample_reference_states(5)
 
-    assert dataset.transitions.shape == (0, 40)
+    assert dataset.transitions.shape == (0, 26)
     assert sampled["joint_pos"].shape == (5, 2)
     assert torch.equal(sampled["joint_pos"], torch.zeros(5, 2))
     assert torch.equal(sampled["joint_vel"], torch.zeros(5, 2))
@@ -126,7 +126,7 @@ def test_soma_motion_dataset_supports_single_frame_rsi_only_source(tmp_path):
         dataset.sample_amp_observations(1)
 
     assert len(expert_dataset) == 2
-    assert expert_dataset.sample_amp_observations(4).shape == (4, 40)
+    assert expert_dataset.sample_amp_observations(4).shape == (4, 26)
 
 
 def test_motion_dataset_set_validate_filters_transitions_and_attaches_aligned_reset_fields(tmp_path):
@@ -134,8 +134,8 @@ def test_motion_dataset_set_validate_filters_transitions_and_attaches_aligned_re
 
     _write_soma_npz(tmp_path / "walk.npz", frames=3)
     dataset = SomaMotionDataset(
-        str(tmp_path),
-        amp_observation_dim=20,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
         joint_names=["joint_a", "joint_b"],
@@ -152,7 +152,7 @@ def test_motion_dataset_set_validate_filters_transitions_and_attaches_aligned_re
     )
 
     assert len(dataset) == 1
-    assert dataset.transitions.shape == (1, 40)
+    assert dataset.transitions.shape == (1, 26)
     sampled = dataset.sample_reference_frames(4)
     assert torch.equal(sampled["joint_pos"], dataset.motions[0]["joint_pos"][1:2].expand(4, -1))
     assert torch.equal(sampled["motor_joint_pos"], motor_positions[1:2].expand(4, -1))
@@ -211,7 +211,7 @@ def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp
     monkeypatch.setattr(amp_module, "resolve_symmetry_config", lambda cfg, env: cfg)
     monkeypatch.setattr(amp_module, "RolloutStorage", Storage)
 
-    obs = {"amp": torch.zeros(1, 20)}
+    obs = {"amp": torch.zeros(1, 13)}
     cfg = {
         "algorithm": {
             "class_name": "fake_amp",
@@ -221,7 +221,7 @@ def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp
             "joint_names": ["joint_a", "joint_b"],
             "body_names": SOMA_TEST_BODY_NAMES,
             "key_body_names": ["left_ankle_x_link"],
-            "observation_profile": "default",
+            "motion_quaternion_format": "wxyz",
             "reference_state_initialization": True,
         },
         "actor": {"class_name": "fake_model"},
@@ -238,7 +238,7 @@ def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp
 
     algorithm = AMP.construct_algorithm(obs, env, cfg, "cpu")
 
-    assert algorithm.kwargs["collect_reference_motions"](4).shape == (4, 40)
+    assert algorithm.kwargs["collect_reference_motions"](4).shape == (4, 26)
     sampled_rsi = algorithm.kwargs["reference_frame_sampler"](5)
     assert torch.equal(sampled_rsi["joint_pos"], torch.zeros(5, 2))
     assert algorithm.kwargs["reference_state_initialization"] is True
@@ -262,8 +262,8 @@ def test_motion_dataset_normalizes_body_order_and_quaternion_to_isaacsim(tmp_pat
     np.savez(tmp_path / "walk.npz", **payload)
 
     dataset = SomaMotionDataset(
-        str(tmp_path),
-        amp_observation_dim=20,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["left_ankle_x_link"],
         body_names=SOMA_TEST_BODY_NAMES,
         joint_names=["joint_a", "joint_b"],
@@ -291,7 +291,7 @@ def test_motion_dataset_accepts_xyzw_source_quaternions(tmp_path):
         body_lin_vel_w=np.zeros((2, 1, 3), dtype=np.float32),
         body_ang_vel_w=np.zeros((2, 1, 3), dtype=np.float32),
     )
-    dataset = MotionDataset(str(tmp_path), amp_observation_dim=15, quaternion_format="xyzw")
+    dataset = MotionDataset(str(tmp_path), amp_observation_dim=11, quaternion_format="xyzw")
     assert torch.allclose(dataset.motions[0]["body_quat_xyzw"][0, 0], torch.tensor([0.0, 0.0, 0.0, 1.0]))
 
 
@@ -304,7 +304,7 @@ def test_soma_motion_dataset_rejects_body_name_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="body_names"):
         SomaMotionDataset(
-            str(tmp_path), amp_observation_dim=20, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
+            str(tmp_path), quaternion_format="wxyz", amp_observation_dim=13, body_names=SOMA_TEST_BODY_NAMES, joint_names=["joint_a", "joint_b"]
         )
 
 
@@ -359,14 +359,14 @@ def test_motion_dataset_uses_external_body_names_and_root_orientation(tmp_path):
     )
 
     dataset = MotionDataset(
-        str(tmp_path),
-        amp_observation_dim=20,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["foot"],
         body_names=["base", "foot"],
     )
 
     assert len(dataset.motions) == 1
-    assert dataset.sample_amp_observations(3).shape == (3, 40)
+    assert dataset.sample_amp_observations(3).shape == (3, 26)
 
 
 def test_motion_dataset_filters_npz_basenames_with_regex(tmp_path, capsys):
@@ -383,8 +383,8 @@ def test_motion_dataset_filters_npz_basenames_with_regex(tmp_path, capsys):
     np.savez(tmp_path / "debug_motion.npz", **payload)
 
     dataset = MotionDataset(
-        str(tmp_path),
-        amp_observation_dim=17,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         motion_file_pattern=r"walking_.*\.npz",
     )
 
@@ -408,8 +408,8 @@ def test_motion_dataset_selects_one_file_per_motion_kind_with_regex(tmp_path, ca
     np.savez(tmp_path / "7_WalkInClockwiseCircle10_stageii.npz", **payload)
 
     dataset = MotionDataset(
-        str(tmp_path),
-        amp_observation_dim=17,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         motion_file_pattern=r".*01_stageii\.npz",
     )
 
@@ -432,8 +432,8 @@ def test_motion_dataset_selects_explicit_file_list(tmp_path):
     np.savez(tmp_path / "debug.npz", **payload)
 
     dataset = MotionDataset(
-        str(tmp_path),
-        amp_observation_dim=17,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         motion_files=["turn_left01_stageii.npz", "run01_stageii.npz"],
     )
 
@@ -444,13 +444,13 @@ def test_motion_dataset_rejects_unknown_explicit_files(tmp_path):
     np.savez(tmp_path / "run01_stageii.npz", fps=np.array([50]))
 
     with pytest.raises(ValueError, match="motion_files not found"):
-        MotionDataset(str(tmp_path), motion_files=["missing.npz"])
+        MotionDataset(str(tmp_path), quaternion_format="wxyz", motion_files=["missing.npz"])
 
 
 def test_motion_dataset_rejects_pattern_and_list_together(tmp_path):
     with pytest.raises(ValueError, match="mutually exclusive"):
         MotionDataset(
-            str(tmp_path),
+            str(tmp_path), quaternion_format="wxyz",
             motion_file_pattern=r".*\.npz",
             motion_files=["run01_stageii.npz"],
         )
@@ -460,10 +460,10 @@ def test_motion_dataset_rejects_regex_without_matches(tmp_path):
     np.savez(tmp_path / "walking.npz", joint_pos=np.zeros((1, 1), dtype=np.float32))
 
     with pytest.raises(ValueError, match="matched no NPZ files"):
-        MotionDataset(str(tmp_path), motion_file_pattern=r"run_.*\.npz")
+        MotionDataset(str(tmp_path), quaternion_format="wxyz", motion_file_pattern=r"run_.*\.npz")
 
 
-def test_motion_dataset_converts_key_bodies_to_root_frame_and_excludes_last_frame(tmp_path):
+def test_motion_dataset_uses_root_relative_world_axes_and_excludes_last_frame(tmp_path):
     root_quat = np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)], dtype=np.float32)
     body_pos = np.array(
         [
@@ -485,15 +485,15 @@ def test_motion_dataset_converts_key_bodies_to_root_frame_and_excludes_last_fram
     )
 
     dataset = MotionDataset(
-        str(tmp_path),
-        amp_observation_dim=17,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=11,
         key_body_names=["foot"],
         body_names=["base", "foot"],
     )
 
     assert len(dataset) == 2
     observation = dataset._get_observation(dataset.motions[0], 0)
-    assert torch.allclose(observation[-3:], torch.tensor([0.0, -1.0, 0.0]), atol=1e-5)
+    assert torch.allclose(observation[-3:], torch.tensor([1.0, 0.0, 0.0]), atol=1e-5)
 
 
 def test_motion_dataset_preloads_vectorized_transitions(tmp_path):
@@ -512,8 +512,8 @@ def test_motion_dataset_preloads_vectorized_transitions(tmp_path):
     )
 
     dataset = MotionDataset(
-        str(tmp_path),
-        amp_observation_dim=17,
+        str(tmp_path), quaternion_format="wxyz",
+        amp_observation_dim=13,
         key_body_names=["foot"],
         body_names=["base", "foot"],
     )
@@ -526,18 +526,18 @@ def test_motion_dataset_preloads_vectorized_transitions(tmp_path):
         )
         assert torch.allclose(dataset.transitions[frame_idx], expected, atol=1e-5)
     sample = dataset.sample_amp_observations(64)
-    assert sample.shape == (64, 40)
+    assert sample.shape == (64, 26)
     assert sample.device == dataset.transitions.device
 
     reference = dataset.sample_reference_frames(64)
-    assert reference["amp_obs"].shape == (64, 20)
-    assert reference["amp_next_obs"].shape == (64, 20)
+    assert reference["amp_obs"].shape == (64, 13)
+    assert reference["amp_next_obs"].shape == (64, 13)
     assert reference["joint_pos"].shape == (64, 2)
     assert reference["root_pos"].shape == (64, 3)
 
     empty_reference = dataset.sample_reference_frames(0)
-    assert empty_reference["amp_obs"].shape == (0, 20)
-    assert empty_reference["amp_next_obs"].shape == (0, 20)
+    assert empty_reference["amp_obs"].shape == (0, 13)
+    assert empty_reference["amp_next_obs"].shape == (0, 13)
     assert empty_reference["joint_pos"].shape == (0, 2)
 
 
@@ -554,7 +554,7 @@ def test_motion_dataset_rejects_joint_contract_mismatch(tmp_path):
     np.savez(tmp_path / "walk.npz", **payload)
 
     with pytest.raises(ValueError, match="joint contract"):
-        MotionDataset(str(tmp_path), joint_names=["joint_a"])
+        MotionDataset(str(tmp_path), quaternion_format="wxyz", joint_names=["joint_a"])
 
 
 def test_amp_transition_mask_excludes_terminated_environments():

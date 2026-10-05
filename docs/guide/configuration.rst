@@ -15,8 +15,6 @@ Select the named-joint NPZ loader in the algorithm configuration:
        "joint_names": ["left_ankle_pitch_joint", "left_ankle_roll_joint"],
        "rsi_joint_names": None,  # Default: use the same joints as AMP.
        "key_body_names": ["left_ankle_roll_link"],
-       "motion_quaternion_format": "wxyz",
-       "observation_profile": "chocolate",
    }
 
 ``VariableDofMotionDataset`` reads ``schema_version="named-joints-v1"`` records.
@@ -25,7 +23,8 @@ Select the named-joint NPZ loader in the algorithm configuration:
 the joint count: zero, the start of every subsequent block, and the final width.
 Supported types and position/velocity widths are ``hinge`` (1/1), ``slide`` (1/1),
 ``ball`` (4/3), and ``free`` (7/6). Ball quaternions and the last four free-joint
-position coordinates are WXYZ; the file's ``quaternion_order`` must be ``wxyz``.
+position coordinates follow the file's ``quaternion_order`` (``xyzw`` or ``wxyz``).
+The loader reads this field and converts all loaded quaternions to XYZW.
 
 AMP features gather the configured ``joint_names`` in configuration order; a
 ball's four position coordinates and three velocity coordinates remain distinct.
@@ -47,7 +46,8 @@ joint positions and velocities as ``joint_pos``/``joint_vel``, plus ``joint_name
 joint contract follows the RSI selection order; later clips are reordered by name.
 ``amp_obs``/``amp_next_obs`` contain only the selected AMP coordinates. Expert
 transition sampling and RSI share the existing reference-frame sampling path.
-Simulator-specific quaternion conversion belongs at the state-write boundary.
+Returned body and joint quaternions use XYZW. Convert at the state-write
+boundary if the simulator requires another order.
 The environment must consume the named joint contract when this loader is enabled;
 legacy reset events expecting one scalar per joint are not compatible.
 
