@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import itertools
 import numpy as np
 import os
 import re
@@ -332,6 +333,7 @@ class BaseMotionDataset(ABC):
                 "root_quat_xyzw": motion["body_quat_xyzw"][:0, 0],
                 "root_lin_vel": motion["body_lin_vel_w"][:0, 0],
                 "root_ang_vel": motion["body_ang_vel_w"][:0, 0],
+                **{name: motion[name][:0] for name in self._reference_state_field_names},
             }
         if len(self.reference_frame_indices) == 0:
             raise RuntimeError("AMP RSI dataset has no reference frames")
@@ -348,6 +350,7 @@ class BaseMotionDataset(ABC):
             "root_lin_vel": ("body_lin_vel_w", 0),
             "root_ang_vel": ("body_ang_vel_w", 0),
         }
+        state_fields.update({name: (name, None) for name in self._reference_state_field_names})
         sampled = {}
         for output_name, (motion_field, body_index) in state_fields.items():
             source = self.motions[0][motion_field]
@@ -372,6 +375,62 @@ class BaseMotionDataset(ABC):
                     source[:, :2] -= motion[motion_field][0, body_index, :2]
                 sampled[output_name][output_ids] = source
         return sampled
+
+    def configure_rsi_support_height_adjustment(self, support_body_boxes, clearance: float = 0.005) -> None:
+        """Precompute compact RSI-only support corrections from loaded body poses."""
+        if not np.isfinite(clearance) or clearance < 0:
+            raise ValueError("RSI support clearance must be finite and nonnegative")
+        if not support_body_boxes:
+            return
+        if self._reference_state_field_names:
+            raise RuntimeError("RSI support height adjustment is already configured")
+        signs = torch.tensor(list(itertools.product((-1.0, 1.0), repeat=3)), dtype=torch.float32, device=self.device)
+        height_offsets, velocity_offsets = [], []
+        for motion in self.motions:
+            if not motion.get("body_names"):
+                raise ValueError("RSI support correction requires body_names in the motion dataset")
+            fps = float(motion["fps"])
+            if not np.isfinite(fps) or fps <= 0:
+                raise ValueError("RSI support correction requires a finite positive motion FPS")
+            lowest_parts = []
+            for name, (center, size) in support_body_boxes.items():
+                if name not in motion["body_names"]:
+                    raise ValueError(f"RSI support body {name!r} is missing from the motion dataset")
+                center = torch.as_tensor(center, dtype=torch.float32, device=self.device)
+                size = torch.as_tensor(size, dtype=torch.float32, device=self.device)
+                if center.shape != (3,) or size.shape != (3,) or not bool((size > 0).all()):
+                    raise ValueError(f"Invalid RSI support box for {name}")
+                body_id = motion["body_names"].index(name)
+                corners = center + signs * size / 2.0
+                quat = motion["body_quat_xyzw"][:, body_id]
+                norm = torch.linalg.vector_norm(quat, dim=-1, keepdim=True)
+                if not bool(torch.isfinite(quat).all()) or bool((norm < 1e-8).any()):
+                    raise ValueError(f"Invalid RSI support quaternion for {name}")
+                quat = quat / norm
+                xyz, w = quat[:, None, :3], quat[:, None, 3:4]
+                local = corners[None].expand(len(quat), -1, -1)
+                twice_cross = 2.0 * torch.cross(xyz.expand_as(local), local, dim=-1)
+                rotated = local + w * twice_cross + torch.cross(xyz.expand_as(local), twice_cross, dim=-1)
+                lowest_parts.append(motion["body_pos_w"][:, body_id, 2] + rotated[..., 2].min(dim=1).values)
+            lowest = torch.stack(lowest_parts).min(dim=0).values
+            if not bool(torch.isfinite(lowest).all()):
+                raise ValueError("Non-finite RSI support height")
+            offset = clearance - torch.quantile(lowest, 0.05)
+            offset = offset + torch.clamp(clearance - (lowest + offset), min=0.0)
+            if len(offset) > 1:
+                rate = torch.as_tensor(
+                    np.gradient(offset.detach().cpu().numpy(), 1.0 / fps),
+                    dtype=offset.dtype,
+                    device=offset.device,
+                )
+            else:
+                rate = torch.zeros_like(offset)
+            height_offsets.append(offset)
+            velocity_offsets.append(rate)
+        for motion, height, velocity in zip(self.motions, height_offsets, velocity_offsets, strict=True):
+            motion["root_height_offset"] = height
+            motion["root_height_velocity_offset"] = velocity
+        self._reference_state_field_names = ("root_height_offset", "root_height_velocity_offset")
 
     def _get_observation(self, motion, frame_idx):
         return self._all_observations(motion)[frame_idx]

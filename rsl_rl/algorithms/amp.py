@@ -62,7 +62,7 @@ def _resolve_rsi_frame_sampler(
     """Keep RSI sampling independent when a dedicated initialization dataset is configured."""
     if rsi_dataset is not None:
         return rsi_dataset.sample_reference_states
-    return expert_dataset.sample_reference_frames
+    return expert_dataset.sample_reference_states
 
 
 class AmpReplayBuffer:
@@ -503,6 +503,8 @@ class AMP(PPO):
             raise ValueError("AMP requires 'motion_dir' to be specified in algorithm config")
         rsi_motion_dir = cfg["algorithm"].pop("rsi_motion_dir", None)
         reference_state_initialization = cfg["algorithm"].pop("reference_state_initialization", False)
+        rsi_support_body_boxes = cfg["algorithm"].pop("rsi_support_body_boxes", None)
+        rsi_support_clearance = cfg["algorithm"].pop("rsi_support_clearance", 0.005)
 
         # Extract body configuration
         key_body_names = cfg["algorithm"].pop("key_body_names", None)
@@ -556,9 +558,17 @@ class AMP(PPO):
                 key_body_names=key_body_names,
                 body_names=body_names,
                 joint_names=joint_names,
+                motion_file_pattern=motion_file_pattern,
+                motion_files=motion_files,
                 require_transitions=False,
                 **dataset_options,
             )
+        if rsi_support_body_boxes:
+            motion_dataset.configure_rsi_support_height_adjustment(rsi_support_body_boxes, rsi_support_clearance)
+            if rsi_motion_dataset is not None:
+                rsi_motion_dataset.configure_rsi_support_height_adjustment(
+                    rsi_support_body_boxes, rsi_support_clearance
+                )
 
         # Extract AMP-specific parameters from config
         amp_params = {
