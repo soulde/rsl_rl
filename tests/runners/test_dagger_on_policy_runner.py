@@ -88,6 +88,8 @@ def test_runner_saves_and_loads_student_and_optimizer_state(tmp_path: Path) -> N
     restored.load(str(path))
     for expected, actual in zip(runner.student.parameters(), restored.student.parameters()):
         assert torch.equal(expected, actual)
+    for expected, actual in zip(runner.teacher.parameters(), restored.teacher.parameters()):
+        assert torch.equal(expected, actual)
     assert restored.current_learning_iteration == 1
 
 
