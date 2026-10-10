@@ -53,6 +53,7 @@ class DaggerOnPolicyRunner:
         )
         self.current_learning_iteration = 0
         self.writer = None
+        self.git_status_repos: list[str] = []
 
     def _validate_groups(self, obs: TensorDict) -> None:
         for group_set in ("student", "teacher"):
@@ -94,6 +95,8 @@ class DaggerOnPolicyRunner:
 
             os.makedirs(self.log_dir, exist_ok=True)
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            if self.git_status_repos:
+                self.writer.add_text("Git/repositories", "\n".join(self.git_status_repos), 0)
         algo_cfg = self.cfg["algorithm"]
         end_iteration = self.current_learning_iteration + num_learning_iterations
         for iteration in range(self.current_learning_iteration, end_iteration):
@@ -170,6 +173,10 @@ class DaggerOnPolicyRunner:
         """Return the student in evaluation mode on the requested device."""
         self.student.eval()
         return self.student.to(device or self.device)
+
+    def add_git_repo_to_log(self, repo_file_path: str) -> None:
+        """Record repository paths for the training launcher logging interface."""
+        self.git_status_repos.append(repo_file_path)
 
 
 def _remove_legacy_model_fields(model_cfg: dict) -> None:
