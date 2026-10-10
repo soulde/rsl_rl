@@ -119,3 +119,10 @@ def test_runner_inference_policy_accepts_grouped_observations() -> None:
     policy = runner.get_inference_policy()
     obs = runner.env.get_observations().select("policy", "depth")
     assert policy(obs).shape == (3, 2)
+
+
+def test_runner_exports_student_to_torchscript(tmp_path: Path) -> None:
+    """The standard play launcher can export a trained depth policy."""
+    runner = DaggerOnPolicyRunner(DummyEnv(), make_cfg())
+    runner.export_policy_to_jit(str(tmp_path))
+    assert (tmp_path / "policy.pt").is_file()
