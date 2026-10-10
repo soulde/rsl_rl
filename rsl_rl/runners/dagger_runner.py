@@ -99,7 +99,8 @@ class DaggerRunner:
         for _ in range(epochs):
             batch = self.storage.sample(batch_size)
             prediction = self.student_policy(batch["observations"])
-            loss = torch.nn.functional.mse_loss(prediction, batch["teacher_actions"])
+            teacher_actions = batch["teacher_actions"].to(prediction.device)
+            loss = torch.nn.functional.mse_loss(prediction, teacher_actions)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
