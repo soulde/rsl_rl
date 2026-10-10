@@ -43,9 +43,13 @@ def make_cfg(teacher_path: Path | None = None) -> dict:
         "obs_groups": {"student": ["policy", "depth"], "teacher": ["privileged"]},
         "student": {
             "class_name": "CNNModel", "hidden_dims": [8], "activation": "elu",
+            "stochastic": {}, "init_noise_std": {}, "noise_std_type": "scalar", "state_dependent_std": False,
             "cnn_cfg": {"output_channels": [4], "kernel_size": 3, "stride": 2},
         },
-        "teacher": teacher,
+        "teacher": {
+            **teacher,
+            "stochastic": {}, "init_noise_std": {}, "noise_std_type": "scalar", "state_dependent_std": False,
+        },
         "algorithm": {
             "collection_steps": 2, "updates_per_round": 1, "batch_size": 3,
             "storage_capacity": 32, "learning_rate": 1e-3,

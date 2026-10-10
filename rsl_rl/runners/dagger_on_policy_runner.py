@@ -29,9 +29,11 @@ class DaggerOnPolicyRunner:
 
         student_cfg = dict(train_cfg["student"])
         student_class = resolve_callable(student_cfg.pop("class_name"))
+        _remove_legacy_model_fields(student_cfg)
         teacher_cfg = dict(train_cfg["teacher"])
         teacher_checkpoint = teacher_cfg.pop("checkpoint", None)
         teacher_class = resolve_callable(teacher_cfg.pop("class_name"))
+        _remove_legacy_model_fields(teacher_cfg)
         model_groups = {"student": list(self.obs_groups["student"]), "teacher": list(self.obs_groups["teacher"])}
         self.student = student_class(obs, model_groups, "student", env.num_actions, **student_cfg).to(self.device)
         self.teacher = teacher_class(obs, model_groups, "teacher", env.num_actions, **teacher_cfg).to(self.device)
@@ -168,3 +170,9 @@ class DaggerOnPolicyRunner:
         """Return the student in evaluation mode on the requested device."""
         self.student.eval()
         return self.student.to(device or self.device)
+
+
+def _remove_legacy_model_fields(model_cfg: dict) -> None:
+    """Drop Isaac Lab's PPO-only compatibility fields before constructing a model."""
+    for key in ("stochastic", "init_noise_std", "noise_std_type", "state_dependent_std"):
+        model_cfg.pop(key, None)
