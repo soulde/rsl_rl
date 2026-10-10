@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
+from tensordict.base import TensorDictBase
 
 from rsl_rl.storage import BetaSchedule, DaggerStorage
+
+ObservationBatch = torch.Tensor | TensorDictBase
 
 
 class DaggerRunner:
@@ -14,8 +17,8 @@ class DaggerRunner:
 
     def __init__(
         self,
-        student_policy: Callable[[torch.Tensor], torch.Tensor],
-        teacher_policy: Callable[[torch.Tensor], torch.Tensor],
+        student_policy: Callable[[ObservationBatch], torch.Tensor],
+        teacher_policy: Callable[[ObservationBatch], torch.Tensor],
         storage: DaggerStorage,
         beta_schedule: BetaSchedule,
     ) -> None:
@@ -27,31 +30,63 @@ class DaggerRunner:
 
     def collect(
         self,
-        observations: torch.Tensor,
-        env_step: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
-        num_steps: int,
+        observations: ObservationBatch,
+        teacher_observations: ObservationBatch | Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+        env_step: Callable[[torch.Tensor], tuple[ObservationBatch, ObservationBatch, torch.Tensor]] | int | None = None,
+        num_steps: int | None = None,
         round_index: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
+    ) -> ObservationBatch | tuple[ObservationBatch, ObservationBatch]:
+        # Preserve the original collect(observations, env_step, num_steps) API;
+        # grouped DAgger callers pass separate student and teacher observations.
+        legacy_call = callable(teacher_observations)
+        if legacy_call:
+            step_fn = teacher_observations
+            teacher_current = observations
+            if num_steps is None and isinstance(env_step, int):
+                num_steps = env_step
+            env_step_fn = step_fn
+        else:
+            if not callable(env_step):
+                raise TypeError("env_step must be callable when student and teacher observations are separate")
+            teacher_current = teacher_observations
+            env_step_fn = env_step
+        if num_steps is None:
+            raise TypeError("num_steps is required")
         if num_steps <= 0:
             raise ValueError("num_steps must be positive")
         round_index = self.round_index if round_index is None else round_index
         beta = self.beta_schedule(round_index)
         current = observations
+        if current.shape[0] != teacher_current.shape[0]:
+            raise ValueError("student and teacher observations must have matching batch dimensions")
         for _ in range(num_steps):
             with torch.no_grad():
                 student_actions = self.student_policy(current)
-                teacher_actions = self.teacher_policy(current)
+                teacher_actions = self.teacher_policy(teacher_current)
             if student_actions.shape != teacher_actions.shape:
                 raise ValueError("student and teacher actions must have matching shapes")
-            use_teacher = torch.rand(current.shape[0], generator=generator, device=current.device) < beta
+            action_device = student_actions.device
+            use_teacher = torch.rand(current.shape[0], generator=generator, device=action_device) < beta
             broadcast_shape = (current.shape[0],) + (1,) * (student_actions.ndim - 1)
             actions = torch.where(use_teacher.reshape(broadcast_shape), teacher_actions, student_actions)
-            next_observations, dones = env_step(actions)
+            step_result = env_step_fn(actions)
+            if legacy_call:
+                if len(step_result) != 2:
+                    raise ValueError("legacy env_step must return (next_observations, dones)")
+                next_observations, dones = step_result
+                next_teacher_observations = next_observations
+            else:
+                if len(step_result) != 3:
+                    raise ValueError("grouped env_step must return (next_student_obs, next_teacher_obs, dones)")
+                next_observations, next_teacher_observations, dones = step_result
             self.storage.add(current, teacher_actions, student_actions, dones, round_index=round_index)
             current = next_observations
+            teacher_current = next_teacher_observations
         self.round_index = max(self.round_index, round_index + 1)
-        return current
+        if legacy_call:
+            return current
+        return current, teacher_current
 
     def update(
         self, optimizer: torch.optim.Optimizer, batch_size: int, epochs: int = 1
