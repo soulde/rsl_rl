@@ -103,6 +103,16 @@ def test_runner_loads_ppo_actor_checkpoint_as_teacher(tmp_path: Path) -> None:
         assert torch.equal(expected, actual)
 
 
+def test_runner_loads_model_state_dict_teacher_checkpoint(tmp_path: Path) -> None:
+    """Load the alternate model_state_dict checkpoint convention."""
+    source = DaggerOnPolicyRunner(DummyEnv(), make_cfg())
+    checkpoint = tmp_path / "teacher_model_state.pt"
+    torch.save({"model_state_dict": source.teacher.state_dict()}, checkpoint)
+    runner = DaggerOnPolicyRunner(DummyEnv(), make_cfg(checkpoint))
+    for expected, actual in zip(source.teacher.parameters(), runner.teacher.parameters()):
+        assert torch.equal(expected, actual)
+
+
 def test_runner_inference_policy_accepts_grouped_observations() -> None:
     """Inference consumes the selected TensorDict groups and returns actions."""
     runner = DaggerOnPolicyRunner(DummyEnv(), make_cfg())
