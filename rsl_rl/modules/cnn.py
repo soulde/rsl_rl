@@ -28,12 +28,14 @@ class CNN(nn.Sequential):
         kernel_size: int | tuple[int, ...] | list[int],
         stride: int | tuple[int, ...] | list[int] = 1,
         dilation: int | tuple[int, ...] | list[int] = 1,
-        padding: str = "none",
+        padding: str | int | list[str | int] = "none",
         norm: str | tuple[str] | list[str] = "none",
         activation: str = "elu",
         max_pool: bool | tuple[bool] | list[bool] = False,
         global_pool: str = "none",
         flatten: bool = True,
+        output_dim: int | None = None,
+        output_activation: str | None = None,
     ) -> None:
         """Initialize the CNN.
 
@@ -44,7 +46,8 @@ class CNN(nn.Sequential):
             kernel_size: List of kernel sizes for each convolutional layer or a single kernel size for all layers.
             stride: List of strides for each convolutional layer or a single stride for all layers.
             dilation: List of dilations for each convolutional layer or a single dilation for all layers.
-            padding: Padding type to use. Either 'none', 'zeros', 'reflect', 'replicate', or 'circular'.
+            padding: Padding mode ('none', 'zeros', 'reflect', 'replicate', or 'circular'), or an explicit
+                symmetric integer padding. A list can provide one mode/value per convolutional layer.
             norm: List of normalization types for each convolutional layer or a single type for all layers. Either
                 'none', 'batch', or 'layer'.
             activation: Activation function to use.
@@ -52,6 +55,8 @@ class CNN(nn.Sequential):
                 single boolean for all layers.
             global_pool: Global pooling type to apply at the end. Either 'none', 'max', or 'avg'.
             flatten: Whether to flatten the output tensor.
+            output_dim: Optional size of a linear projection applied after flattening.
+            output_activation: Optional activation applied after the output projection.
         """
         super().__init__()
 
@@ -67,11 +72,21 @@ class CNN(nn.Sequential):
             k = get_param(kernel_size, idx)
             s = get_param(stride, idx)
             d = get_param(dilation, idx)
-            p = (
-                _compute_padding(last_dim, k, s, d)
-                if padding in ["zeros", "reflect", "replicate", "circular"]
-                else (0, 0)
-            )
+            padding_i = get_param(padding, idx)
+            if isinstance(padding_i, int):
+                p = (padding_i, padding_i)
+                conv_padding = padding_i
+                conv_padding_mode = "zeros"
+            elif padding_i in ["zeros", "reflect", "replicate", "circular"]:
+                p = _compute_padding(last_dim, k, s, d)
+                conv_padding = p
+                conv_padding_mode = padding_i
+            elif padding_i == "none":
+                p = (0, 0)
+                conv_padding = 0
+                conv_padding_mode = "zeros"
+            else:
+                raise ValueError(f"Unsupported padding value: {padding_i}.")
 
             # Append convolutional layer
             layers.append(
@@ -80,9 +95,9 @@ class CNN(nn.Sequential):
                     out_channels=output_channels[idx],
                     kernel_size=k,
                     stride=s,
-                    padding=p,
+                    padding=conv_padding,
                     dilation=d,
-                    padding_mode=padding if padding in ["zeros", "reflect", "replicate", "circular"] else "zeros",
+                    padding_mode=conv_padding_mode,
                 )
             )
 
@@ -129,9 +144,26 @@ class CNN(nn.Sequential):
         if flatten:
             layers.append(nn.Flatten(start_dim=1))
 
+        # Optionally project the flattened feature vector to a compact latent. This
+        # keeps the CNN reusable for depth policies that fuse image features with
+        # proprioception before their policy MLP.
+        if output_dim is not None:
+            if not flatten:
+                raise ValueError("An output projection requires flatten=True.")
+            if output_dim <= 0:
+                raise ValueError(f"output_dim must be positive, got {output_dim}.")
+            flattened_dim = last_channels * last_dim[0] * last_dim[1]
+            layers.append(nn.Linear(flattened_dim, output_dim))
+            if output_activation is not None:
+                layers.append(resolve_nn_activation(output_activation))
+
         # Store final output dimension
         self._output_channels = last_channels if not flatten else None
-        self._output_dim = last_dim if not flatten else last_channels * last_dim[0] * last_dim[1]
+        self._output_dim = (
+            output_dim
+            if output_dim is not None
+            else (last_dim if not flatten else last_channels * last_dim[0] * last_dim[1])
+        )
 
         # Register the layers
         for idx, layer in enumerate(layers):
