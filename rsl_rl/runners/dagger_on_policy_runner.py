@@ -158,9 +158,11 @@ class DaggerOnPolicyRunner:
     ) -> dict | None:
         """Restore selected state from a runner checkpoint."""
         checkpoint = torch.load(path, map_location=map_location or self.device, weights_only=False)
-        load_cfg = load_cfg or {"student": True, "optimizer": True, "dagger": True, "iteration": True}
+        load_cfg = load_cfg or {"student": True, "teacher": True, "optimizer": True, "dagger": True, "iteration": True}
         if load_cfg.get("student", True):
             self.student.load_state_dict(checkpoint["student_state_dict"], strict=strict)
+        if load_cfg.get("teacher", True) and "teacher_state_dict" in checkpoint:
+            self.teacher.load_state_dict(checkpoint["teacher_state_dict"], strict=strict)
         if load_cfg.get("optimizer", True) and "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if load_cfg.get("dagger", True) and "dagger_state_dict" in checkpoint:
