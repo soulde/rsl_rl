@@ -178,6 +178,28 @@ class DaggerOnPolicyRunner:
         """Record repository paths for the training launcher logging interface."""
         self.git_status_repos.append(repo_file_path)
 
+    def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
+        """Export the deterministic student policy as a TorchScript module."""
+        os.makedirs(path, exist_ok=True)
+        model = self.student.as_jit().to("cpu")
+        torch.jit.script(model).save(os.path.join(path, filename))
+
+    def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
+        """Export the deterministic student policy in the RSL-RL ONNX format."""
+        os.makedirs(path, exist_ok=True)
+        model = self.student.as_onnx(verbose=verbose).to("cpu")
+        model.eval()
+        torch.onnx.export(
+            model,
+            model.get_dummy_inputs(),
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=18,
+            verbose=verbose,
+            input_names=model.input_names,
+            output_names=model.output_names,
+        )
+
 
 def _remove_legacy_model_fields(model_cfg: dict) -> None:
     """Drop Isaac Lab's PPO-only compatibility fields before constructing a model."""
