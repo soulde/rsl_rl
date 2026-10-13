@@ -16,6 +16,8 @@ from rsl_rl.models import MLPModel
 from rsl_rl.utils import check_nan, resolve_callable
 from rsl_rl.utils.logger import Logger
 
+from .cnn_export import export_cnn_policy_pair
+
 
 class OnPolicyRunner:
     """On-policy runner for reinforcement learning algorithms."""
@@ -23,11 +25,20 @@ class OnPolicyRunner:
     alg: PPO
     """The actor-critic algorithm."""
 
-    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        env: VecEnv,
+        train_cfg: dict,
+        log_dir: str | None = None,
+        device: str = "cpu",
+        resume_checkpoint_path: str | None = None,
+    ) -> None:
         """Construct the runner, algorithm, and logging stack."""
         self.env = env
         self.cfg = train_cfg
         self.device = device
+        if resume_checkpoint_path is not None:
+            self.cfg["resume_checkpoint_path"] = resume_checkpoint_path
 
         # Setup multi-GPU training if enabled
         self._configure_multi_gpu()
@@ -155,6 +166,13 @@ class OnPolicyRunner:
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
+        if self.cfg.get("export_policy_on_save", False):
+            try:
+                export_cnn_policy_pair(
+                    self.alg.get_policy(), path, opset_version=self.cfg.get("onnx_export_opset_version", 11)
+                )
+            except Exception as error:
+                print(f"[WARN] Failed to export split CNN policy for {path}: {error}")
 
     def load(
         self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location: str | None = None
