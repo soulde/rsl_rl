@@ -130,6 +130,7 @@ class RolloutStorage:
         obs: TensorDict,
         actions_shape: tuple[int, ...] | list[int],
         device: str = "cpu",
+        store_privileged_actions: bool = False,
     ) -> None:
         """Allocate rollout buffers for a specific training mode and batch shape."""
         self.training_type = training_type
@@ -137,6 +138,7 @@ class RolloutStorage:
         self.num_transitions_per_env = num_transitions_per_env
         self.num_envs = num_envs
         self.actions_shape = actions_shape
+        self.store_privileged_actions = store_privileged_actions
 
         # Core
         self.observations = TensorDict(
@@ -152,7 +154,7 @@ class RolloutStorage:
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
         # For distillation
-        if training_type == "distillation":
+        if training_type == "distillation" or store_privileged_actions:
             self.privileged_actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
 
         # For reinforcement learning
@@ -183,7 +185,7 @@ class RolloutStorage:
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # For distillation
-        if self.training_type == "distillation":
+        if self.training_type == "distillation" or self.store_privileged_actions:
             self.privileged_actions[self.step].copy_(transition.privileged_actions)  # type: ignore
 
         # For reinforcement learning
@@ -222,7 +224,12 @@ class RolloutStorage:
             )
 
     # For reinforcement learning with feedforward networks
-    def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator[Batch, None, None]:
+    def mini_batch_generator(
+        self,
+        num_mini_batches: int,
+        num_epochs: int = 8,
+        reshuffle_each_epoch: bool = False,
+    ) -> Generator[Batch, None, None]:
         """Yield shuffled flat mini-batches for feedforward RL updates."""
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
@@ -238,8 +245,13 @@ class RolloutStorage:
         old_actions_log_prob = self.actions_log_prob.flatten(0, 1)
         advantages = self.advantages.flatten(0, 1)
         old_distribution_params = tuple(p.flatten(0, 1) for p in self.distribution_params)  # type: ignore
+        privileged_actions = (
+            self.privileged_actions.flatten(0, 1) if self.store_privileged_actions else None
+        )
 
         for epoch in range(num_epochs):
+            if reshuffle_each_epoch and epoch > 0:
+                indices = torch.randperm(num_mini_batches * mini_batch_size, requires_grad=False, device=self.device)
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
                 start = i * mini_batch_size
@@ -255,6 +267,7 @@ class RolloutStorage:
                     returns=returns[batch_idx],
                     old_actions_log_prob=old_actions_log_prob[batch_idx],
                     old_distribution_params=tuple(p[batch_idx] for p in old_distribution_params),
+                    privileged_actions=privileged_actions[batch_idx] if privileged_actions is not None else None,
                 )
 
     # For reinforcement learning with recurrent networks

@@ -100,6 +100,33 @@ class TestMiniBatchGenerator:
 
         assert batch_count == num_mini_batches * num_epochs
 
+    def test_reshuffle_each_epoch_is_opt_in(self) -> None:
+        """PHP can reshuffle every epoch while generic PPO keeps its default order."""
+        storage, obs = _make_storage_and_obs()
+        _fill_with_identifiable_data(storage, obs)
+        storage.actions = torch.arange(NUM_STEPS * NUM_ENVS).view(NUM_STEPS, NUM_ENVS, 1).float()
+
+        def epoch_order(reshuffle_each_epoch: bool) -> list[torch.Tensor]:
+            torch.manual_seed(42)
+            batches = list(
+                storage.mini_batch_generator(
+                    num_mini_batches=4,
+                    num_epochs=2,
+                    reshuffle_each_epoch=reshuffle_each_epoch,
+                )
+            )
+            return [
+                torch.cat([batch.actions for batch in batches[start : start + 4]], dim=0).squeeze(-1)
+                for start in (0, 4)
+            ]
+
+        default_first, default_second = epoch_order(reshuffle_each_epoch=False)
+        php_first, php_second = epoch_order(reshuffle_each_epoch=True)
+
+        assert torch.equal(default_first, default_second)
+        assert not torch.equal(php_first, php_second)
+        assert torch.equal(php_first.sort().values, php_second.sort().values)
+
     def test_batch_fields_are_consistent(self) -> None:
         """All fields within a batch should index the same transitions."""
         storage, obs = _make_storage_and_obs()

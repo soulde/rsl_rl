@@ -46,6 +46,7 @@ class PPO:
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
         optimizer: str = "adam",
+        weight_decay: float | None = None,
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
         desired_kl: float = 0.01,
@@ -58,6 +59,8 @@ class PPO:
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
         min_learning_rate: float = 1.0e-5,
+        timeout_bootstrap_from_final_obs: bool = False,
+        reshuffle_minibatches_each_epoch: bool = False,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -90,8 +93,11 @@ class PPO:
         self._raw_critic = self.critic
 
         # Create the optimizer
+        optimizer_kwargs = {"lr": learning_rate}
+        if weight_decay is not None:
+            optimizer_kwargs["weight_decay"] = weight_decay
         self.optimizer = resolve_optimizer(optimizer)(
-            chain(self.actor.parameters(), self.critic.parameters()), lr=learning_rate
+            chain(self.actor.parameters(), self.critic.parameters()), **optimizer_kwargs
         )  # type: ignore
 
         # Add storage
@@ -110,6 +116,8 @@ class PPO:
         if min_learning_rate <= 0.0:
             raise ValueError("min_learning_rate must be positive.")
         self.min_learning_rate = min_learning_rate
+        self.timeout_bootstrap_from_final_obs = timeout_bootstrap_from_final_obs
+        self.reshuffle_minibatches_each_epoch = reshuffle_minibatches_each_epoch
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -151,10 +159,29 @@ class PPO:
             # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
 
-        # Bootstrapping on time outs
+        # Bootstrap timeout transitions from pre-reset observations when
+        # requested. Keep the original transition-value behavior by default.
         if "time_outs" in extras:
+            time_outs = extras["time_outs"]
+            timeout_values = self.transition.values
+            if self.timeout_bootstrap_from_final_obs and torch.any(time_outs):
+                final_obs = extras.get("final_obs")
+                if final_obs is None:
+                    raise KeyError(
+                        "timeout_bootstrap_from_final_obs=True requires extras['final_obs'] "
+                        "when a timeout occurs."
+                    )
+                if not isinstance(final_obs, TensorDict):
+                    batch_size = next(
+                        value.shape[0] for value in final_obs.values() if isinstance(value, torch.Tensor)
+                    )
+                    final_obs = TensorDict(final_obs, batch_size=[batch_size], device=self.device)
+                else:
+                    final_obs = final_obs.to(self.device)
+                with torch.no_grad():
+                    timeout_values = self.critic(final_obs)
             self.transition.rewards += self.gamma * torch.squeeze(
-                self.transition.values * extras["time_outs"].unsqueeze(1).to(self.device),  # type: ignore
+                timeout_values * time_outs.reshape(-1, 1).to(self.device),
                 1,
             )
 
@@ -206,7 +233,11 @@ class PPO:
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(
+                self.num_mini_batches,
+                self.num_learning_epochs,
+                reshuffle_each_epoch=self.reshuffle_minibatches_each_epoch,
+            )
 
         # Iterate over mini-batches
         for batch in generator:
@@ -236,10 +267,10 @@ class PPO:
             entropy = self.actor.output_entropy[:original_batch_size]
 
             # Compute KL divergence and adapt the learning rate
-            if self.desired_kl is not None and self.schedule == "adaptive":
+            if self.desired_kl is not None and self.schedule == "adaptive" and self._should_adapt_learning_rate():
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                    kl_mean = torch.mean(kl)
+                    kl_mean = self._compute_kl_mean(kl, batch, original_batch_size)
 
                     # Reduce the KL divergence across all GPUs
                     if self.is_multi_gpu:
@@ -269,7 +300,8 @@ class PPO:
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_per_sample = torch.max(surrogate, surrogate_clipped)
+            surrogate_loss = surrogate_per_sample.mean()
 
             # Value function loss
             if self.use_clipped_value_loss:
@@ -280,7 +312,15 @@ class PPO:
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            loss = self._compose_policy_value_loss(
+                surrogate_loss,
+                value_loss,
+                entropy.mean(),
+                surrogate_per_sample=surrogate_per_sample[:original_batch_size],
+                entropy_per_sample=entropy[:original_batch_size],
+                batch=batch,
+                original_batch_size=original_batch_size,
+            )
 
             # Algorithms layered on PPO (for example AMP) can contribute a
             # minibatch loss to this same optimizer step.
@@ -361,6 +401,29 @@ class PPO:
     def _compute_auxiliary_loss(self, batch, original_batch_size: int) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
         """Return an optional loss and metrics to include in each PPO minibatch step."""
         return None, {}
+
+    def _compose_policy_value_loss(
+        self,
+        surrogate_loss: torch.Tensor,
+        value_loss: torch.Tensor,
+        mean_entropy: torch.Tensor,
+        *,
+        surrogate_per_sample: torch.Tensor | None = None,
+        entropy_per_sample: torch.Tensor | None = None,
+        batch=None,
+        original_batch_size: int | None = None,
+    ) -> torch.Tensor:
+        """Combine PPO policy, value, and entropy losses; subclasses may adjust their weights."""
+        return surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * mean_entropy
+
+    def _compute_kl_mean(self, kl: torch.Tensor, batch, original_batch_size: int) -> torch.Tensor:
+        """Reduce per-sample KL values; subclasses may apply sample weights."""
+        del batch, original_batch_size
+        return torch.mean(kl)
+
+    def _should_adapt_learning_rate(self) -> bool:
+        """Whether the adaptive KL schedule should update the optimizer learning rate."""
+        return True
 
     def _after_optimizer_step(self) -> None:
         """Update auxiliary state after each optimizer step."""

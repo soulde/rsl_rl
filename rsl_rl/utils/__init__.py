@@ -6,6 +6,7 @@
 """Helper functions."""
 
 from .log_writer import LogWriter
+from .model_checkpoint import load_actor_checkpoint
 from .neptune_log_writer import NeptuneLogWriter
 from .utils import (
     check_nan,
@@ -22,6 +23,7 @@ from .wandb_log_writer import WandbLogWriter
 
 __all__ = [
     "LogWriter",
+    "load_actor_checkpoint",
     "NeptuneLogWriter",
     "WandbLogWriter",
     "check_nan",

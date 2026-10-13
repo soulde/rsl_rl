@@ -78,6 +78,17 @@ def test_runner_learn_updates_student_but_never_teacher() -> None:
     assert runner.current_learning_iteration == 1
 
 
+def test_runner_can_clear_rollout_storage_after_each_round() -> None:
+    """PHP pure DAgger consumes and clears the current rollout after its update."""
+    cfg = make_cfg()
+    cfg["algorithm"]["clear_storage_after_update"] = True
+    runner = DaggerOnPolicyRunner(DummyEnv(), cfg)
+
+    runner.learn(1)
+
+    assert len(runner.storage) == 0
+
+
 def test_runner_saves_and_loads_student_and_optimizer_state(tmp_path: Path) -> None:
     """Checkpoint round-trip restores parameters and iteration."""
     runner = DaggerOnPolicyRunner(DummyEnv(), make_cfg())
