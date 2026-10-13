@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import torch
 from tensordict.base import TensorDictBase
@@ -21,11 +21,13 @@ class DaggerRunner:
         teacher_policy: Callable[[ObservationBatch], torch.Tensor],
         storage: DaggerStorage,
         beta_schedule: BetaSchedule,
+        skip_beta_sampling_at_endpoints: bool = False,
     ) -> None:
         self.student_policy = student_policy
         self.teacher_policy = teacher_policy
         self.storage = storage
         self.beta_schedule = beta_schedule
+        self.skip_beta_sampling_at_endpoints = skip_beta_sampling_at_endpoints
         self.round_index = 0
 
     def collect(
@@ -66,10 +68,15 @@ class DaggerRunner:
                 teacher_actions = self.teacher_policy(teacher_current)
             if student_actions.shape != teacher_actions.shape:
                 raise ValueError("student and teacher actions must have matching shapes")
-            action_device = student_actions.device
-            use_teacher = torch.rand(current.shape[0], generator=generator, device=action_device) < beta
-            broadcast_shape = (current.shape[0],) + (1,) * (student_actions.ndim - 1)
-            actions = torch.where(use_teacher.reshape(broadcast_shape), teacher_actions, student_actions)
+            if self.skip_beta_sampling_at_endpoints and beta <= 0.0:
+                actions = student_actions
+            elif self.skip_beta_sampling_at_endpoints and beta >= 1.0:
+                actions = teacher_actions
+            else:
+                action_device = student_actions.device
+                use_teacher = torch.rand(current.shape[0], generator=generator, device=action_device) < beta
+                broadcast_shape = (current.shape[0],) + (1,) * (student_actions.ndim - 1)
+                actions = torch.where(use_teacher.reshape(broadcast_shape), teacher_actions, student_actions)
             step_result = env_step_fn(actions)
             if legacy_call:
                 if len(step_result) != 2:
@@ -103,6 +110,35 @@ class DaggerRunner:
             loss = torch.nn.functional.mse_loss(prediction, teacher_actions)
             optimizer.zero_grad()
             loss.backward()
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        return {"loss": sum(losses) / len(losses)}
+
+    def update_minibatches(
+        self,
+        optimizer: torch.optim.Optimizer,
+        student_policy: Callable[[ObservationBatch], torch.Tensor],
+        num_mini_batches: int,
+        num_epochs: int = 1,
+        max_grad_norm: float | None = None,
+        parameters: Iterable[torch.nn.Parameter] | None = None,
+    ) -> dict[str, float]:
+        """Train over shuffled full-storage minibatches for each epoch."""
+        if len(self.storage) == 0:
+            raise ValueError("cannot update an empty DAgger storage")
+        if max_grad_norm is not None:
+            if max_grad_norm <= 0 or parameters is None:
+                raise ValueError("positive max_grad_norm requires model parameters")
+            parameters = tuple(parameters)
+        losses: list[float] = []
+        for batch in self.storage.mini_batch_generator(num_mini_batches, num_epochs):
+            prediction = student_policy(batch["observations"])
+            teacher_actions = batch["teacher_actions"].to(prediction.device)
+            loss = torch.nn.functional.mse_loss(prediction, teacher_actions)
+            optimizer.zero_grad()
+            loss.backward()
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(parameters, max_grad_norm)
             optimizer.step()
             losses.append(float(loss.detach()))
         return {"loss": sum(losses) / len(losses)}

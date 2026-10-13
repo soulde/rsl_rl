@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from collections.abc import Generator
 from tensordict.base import TensorDictBase
 
 
@@ -88,6 +89,31 @@ class DaggerStorage:
             raise ValueError("batch_size must be in [1, len(storage)]")
         indices = torch.randperm(len(self), generator=generator, device=self.device)[:batch_size]
         return {key: value[indices] for key, value in self._fields.items()}
+
+    def mini_batch_generator(
+        self,
+        num_mini_batches: int,
+        num_epochs: int = 1,
+        generator: torch.Generator | None = None,
+    ) -> Generator[dict[str, torch.Tensor | TensorDictBase], None, None]:
+        """Yield shuffled minibatches, reshuffling the full dataset each epoch."""
+        if num_mini_batches <= 0 or num_epochs <= 0:
+            raise ValueError("num_mini_batches and num_epochs must be positive")
+        if not self._fields:
+            raise ValueError("cannot generate minibatches from empty storage")
+        batch_size = len(self) // num_mini_batches
+        if batch_size <= 0:
+            raise ValueError(
+                f"num_mini_batches ({num_mini_batches}) exceeds the stored sample count ({len(self)})"
+            )
+        sample_count = batch_size * num_mini_batches
+        for _ in range(num_epochs):
+            indices = torch.randperm(len(self), generator=generator, device=self.device)[:sample_count]
+            for mini_batch in range(num_mini_batches):
+                start = mini_batch * batch_size
+                stop = start + batch_size
+                batch_indices = indices[start:stop]
+                yield {key: value[batch_indices] for key, value in self._fields.items()}
 
     def clear(self) -> None:
         self._fields.clear()
