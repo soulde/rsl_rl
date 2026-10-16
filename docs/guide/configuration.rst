@@ -11,6 +11,7 @@ Select the named-joint NPZ loader in the algorithm configuration:
    algorithm = {
        "class_name": "rsl_rl.algorithms:AMP",
        "motion_dataset_format": "variable_dof",
+       "amp_coordinate_frame": "heading",  # Optional; default is "world".
        "motion_dir": "motions/robot",
        "joint_names": ["left_ankle_pitch_joint", "left_ankle_roll_joint"],
        "rsi_joint_names": None,  # Default: use the same joints as AMP.

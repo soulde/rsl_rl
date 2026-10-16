@@ -75,20 +75,35 @@ AMP motion observation contract
 
 All motion loaders use one observation layout, concatenated in this order:
 
-1. Root linear velocity in world axes (3).
-2. Root angular velocity in world axes (3).
+1. Root linear velocity in configured AMP axes (3).
+2. Root angular velocity in configured AMP axes (3).
 3. Configured joint positions.
 4. Configured joint velocities.
-5. Configured key-point positions minus the root position, expressed in world
+5. Configured key-point positions minus the root position, expressed in configured AMP
    axes (3 per point, in ``key_body_names`` order).
 
-Root height and rotation features are excluded. Positions are not rotated into
-root-local axes; velocities are absolute velocities, not relative velocities.
+Root height and rotation features are excluded. ``amp_coordinate_frame="world"``
+is the backwards-compatible default. With ``"heading"``, the feature builder
+rotates root velocities and root-relative keypoints by inverse root yaw. Z remains
+world-up; roll and pitch are not removed. Velocities are absolute physical
+velocities expressed in these axes, not derivatives relative to the moving frame.
 The first body in the configured motion body order is the root. The environment
 must produce the same feature order, joint/key-point order and velocity reference
 point. Legacy ``observation_profile`` is ignored.
 ``amp_include_root_height`` defaults to excluded; setting it to ``True`` is an error.
 Dimensions must match ``6 + joint_position_width + joint_velocity_width + 3 * key_point_count``.
+
+The setting applies to all motion loaders and to cached expert transitions. Each
+endpoint uses its own root heading. Environment-side AMP observations must use
+the same axes, ordering, quaternion convention and root velocity reference point.
+The exported helpers ``rsl_rl.datasets.amp_features_to_heading_frame`` and
+``world_to_heading_frame`` implement the same convention for new environments.
+The first accepts already assembled world-axis features, root XYZW quaternions,
+and the total joint-position-plus-joint-velocity feature width. It leaves joint
+coordinates unchanged. NPZ schemas, raw loaded motion tensors and RSI state
+outputs are unaffected; do not pre-rotate dataset files or convert twice.
+Invalid frame names raise errors. Old world-frame discriminator normalizers,
+replay buffers and weights must not be resumed as heading-frame AMP state.
 
 Input quaternion order follows the selected dataset: BeyondMimic uses WXYZ,
 SOMA uses XYZW, and variable-DOF records declare ``quaternion_order`` in each
