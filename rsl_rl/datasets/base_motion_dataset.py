@@ -10,9 +10,11 @@ import re
 import torch
 from abc import ABC, abstractmethod
 
+from .amp_features import amp_features_to_heading_frame
+
 
 class BaseMotionDataset(ABC):
-    """NPZ motion pipeline with one world-axis AMP feature layout.
+    """NPZ motion pipeline with a shared world- or heading-axis AMP feature layout.
 
     Features concatenate root linear/angular velocity, joint position/velocity,
     and root-relative key-point positions, in that order. Loaded quaternions
@@ -35,7 +37,11 @@ class BaseMotionDataset(ABC):
         motion_file_pattern: str | None = None,
         motion_files: list[str] | None = None,
         require_transitions: bool = True,
+        amp_coordinate_frame: str = "world",
     ):
+        if amp_coordinate_frame not in ("world", "heading"):
+            raise ValueError("amp_coordinate_frame must be 'world' or 'heading'")
+        self.amp_coordinate_frame = amp_coordinate_frame
         self.device = device
         self.amp_observation_dim = amp_observation_dim
         self.time_between_frames = time_between_frames
@@ -446,7 +452,7 @@ class BaseMotionDataset(ABC):
         # Features use world axes. Positions are relative to the root,
         # while velocities are absolute velocities expressed in world axes.
         body_pos_relative = (key_body_pos - root_pos).flatten(start_dim=1)
-        return torch.cat(
+        features = torch.cat(
             [
                 motion["body_lin_vel_w"][:, 0],
                 motion["body_ang_vel_w"][:, 0],
@@ -456,6 +462,11 @@ class BaseMotionDataset(ABC):
             ],
             dim=-1,
         )
+        if self.amp_coordinate_frame == "heading":
+            return amp_features_to_heading_frame(
+                features, motion["body_quat_xyzw"][:, 0], joint_pos.shape[-1] + joint_vel.shape[-1]
+            )
+        return features
 
     def __len__(self):
         return len(self.frame_indices)
