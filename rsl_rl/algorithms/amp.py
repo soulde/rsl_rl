@@ -528,7 +528,10 @@ class AMP(PPO):
 
         motion_dataset_class = resolve_motion_dataset_class(cfg["algorithm"])
         rsi_joint_names = cfg["algorithm"].pop("rsi_joint_names", None)
-        dataset_options = {"amp_coordinate_frame": cfg["algorithm"].pop("amp_coordinate_frame", "world")}
+        dataset_options = {
+            "amp_coordinate_frame": cfg["algorithm"].pop("amp_coordinate_frame", "world"),
+            "marker_body_points": cfg["algorithm"].pop("marker_body_points", None),
+        }
         if rsi_joint_names is not None:
             from rsl_rl.datasets import VariableDofMotionDataset
 
