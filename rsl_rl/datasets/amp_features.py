@@ -45,3 +45,40 @@ def amp_features_to_heading_frame(
         ),
         dim=-1,
     )
+
+
+def world_to_body_frame(vectors: torch.Tensor, root_quat_xyzw: torch.Tensor) -> torch.Tensor:
+    """Inverse full root rotation of world vectors; input quaternions are XYZW."""
+    q = root_quat_xyzw
+    while q.ndim < vectors.ndim:
+        q = q.unsqueeze(-2)
+    xyz = q[..., :3].expand_as(vectors)
+    uv = torch.cross(xyz, vectors, dim=-1)
+    return vectors - 2.0 * q[..., 3:] * uv + 2.0 * torch.cross(xyz, uv, dim=-1)
+
+
+def amp_features_to_body_frame(
+    features: torch.Tensor, root_quat_xyzw: torch.Tensor, joint_dim: int
+) -> torch.Tensor:
+    """Convert AMP velocities/keypoints to the full root body frame; while retaining all joint feature coordinates.
+
+    Input order is root linear velocity (3), angular velocity (3), joint position
+    and velocity (``joint_dim`` total), then root-relative keypoints (3 per point).
+    Positions must already have the root position subtracted. Each transition
+    endpoint must be converted using its own root orientation.
+    """
+    keypoint_start = 6 + joint_dim
+    keypoint_width = features.shape[-1] - keypoint_start
+    if joint_dim < 0 or keypoint_width < 0 or keypoint_width % 3:
+        raise ValueError("AMP feature width must be 6 + joint_dim + 3 * keypoint_count")
+    shape = features.shape[:-1]
+    return torch.cat(
+        (
+            world_to_body_frame(features[..., :6].reshape(*shape, 2, 3), root_quat_xyzw).flatten(-2),
+            features[..., 6:keypoint_start],
+            world_to_body_frame(
+                features[..., keypoint_start:].reshape(*shape, keypoint_width // 3, 3), root_quat_xyzw
+            ).flatten(-2),
+        ),
+        dim=-1,
+    )
