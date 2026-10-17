@@ -10,7 +10,7 @@ import re
 import torch
 from abc import ABC, abstractmethod
 
-from .amp_features import amp_features_to_heading_frame
+from .amp_features import amp_features_to_heading_frame, amp_features_to_body_frame
 
 
 class BaseMotionDataset(ABC):
@@ -39,8 +39,8 @@ class BaseMotionDataset(ABC):
         require_transitions: bool = True,
         amp_coordinate_frame: str = "world",
     ):
-        if amp_coordinate_frame not in ("world", "heading"):
-            raise ValueError("amp_coordinate_frame must be 'world' or 'heading'")
+        if amp_coordinate_frame not in ("world", "heading", "body"):
+            raise ValueError("amp_coordinate_frame must be 'world', 'heading', or 'body'")
         self.amp_coordinate_frame = amp_coordinate_frame
         self.device = device
         self.amp_observation_dim = amp_observation_dim
@@ -462,6 +462,10 @@ class BaseMotionDataset(ABC):
             ],
             dim=-1,
         )
+        if self.amp_coordinate_frame == "body":
+            return amp_features_to_body_frame(
+                features, motion["body_quat_xyzw"][:, 0], joint_pos.shape[-1] + joint_vel.shape[-1]
+            )
         if self.amp_coordinate_frame == "heading":
             return amp_features_to_heading_frame(
                 features, motion["body_quat_xyzw"][:, 0], joint_pos.shape[-1] + joint_vel.shape[-1]
