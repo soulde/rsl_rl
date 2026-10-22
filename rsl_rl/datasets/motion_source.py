@@ -16,22 +16,34 @@ def resolve_motion_dir(source: str | Path) -> str:
     parsed = urlparse(source)
     if not parsed.scheme:
         return source
-    if parsed.scheme not in {"http", "https"}:
+    parts = [part for part in parsed.path.split("/") if part]
+    if parsed.scheme in {"modelscope", "ms"}:
+        hub = "modelscope"
+        repo_type = "dataset"
+        if not parsed.netloc:
+            raise ValueError(f"AMP motion Hub URL must include an owner and repository: {source}")
+        parts.insert(0, parsed.netloc)
+    elif parsed.scheme in {"huggingface", "hf"}:
+        hub = "huggingface"
+        repo_type = "dataset"
+        if not parsed.netloc:
+            raise ValueError(f"AMP motion Hub URL must include an owner and repository: {source}")
+        parts.insert(0, parsed.netloc)
+    elif parsed.scheme not in {"http", "https"}:
         raise ValueError(
             f"Unsupported AMP motion source scheme {parsed.scheme!r}; use a local path, "
             "ModelScope URL, or Hugging Face URL."
         )
-
-    host = (parsed.hostname or "").lower()
-    parts = [part for part in parsed.path.split("/") if part]
-    if host in {"modelscope.cn", "www.modelscope.cn"}:
-        hub = "modelscope"
-    elif host in {"huggingface.co", "www.huggingface.co", "hf.co"}:
-        hub = "huggingface"
     else:
-        raise ValueError(f"Unsupported AMP motion Hub URL host: {host or '<missing>'}")
+        host = (parsed.hostname or "").lower()
+        if host in {"modelscope.cn", "www.modelscope.cn"}:
+            hub = "modelscope"
+        elif host in {"huggingface.co", "www.huggingface.co", "hf.co"}:
+            hub = "huggingface"
+        else:
+            raise ValueError(f"Unsupported AMP motion Hub URL host: {host or '<missing>'}")
+        repo_type = "model"
 
-    repo_type = "model"
     if parts and parts[0] in {"datasets", "models"}:
         repo_type = "dataset" if parts[0] == "datasets" else "model"
         parts = parts[1:]
