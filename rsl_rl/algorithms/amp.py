@@ -497,11 +497,16 @@ class AMP(PPO):
         amp_groups = cfg["obs_groups"]["discriminator"]
         amp_dim = sum(obs[group].shape[-1] for group in amp_groups)
 
-        # Load motion dataset from config path
+        # Resolve local paths and optional ModelScope/Hugging Face repository URLs.
         motion_dir = cfg["algorithm"].pop("motion_dir", None)
         if motion_dir is None:
             raise ValueError("AMP requires 'motion_dir' to be specified in algorithm config")
+        from rsl_rl.datasets import resolve_motion_dir
+
+        motion_dir = resolve_motion_dir(motion_dir)
         rsi_motion_dir = cfg["algorithm"].pop("rsi_motion_dir", None)
+        if rsi_motion_dir:
+            rsi_motion_dir = resolve_motion_dir(rsi_motion_dir)
         reference_state_initialization = cfg["algorithm"].pop("reference_state_initialization", False)
         rsi_support_body_boxes = cfg["algorithm"].pop("rsi_support_body_boxes", None)
         rsi_support_clearance = cfg["algorithm"].pop("rsi_support_clearance", 0.005)

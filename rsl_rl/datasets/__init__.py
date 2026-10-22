@@ -6,12 +6,13 @@
 """Datasets for AMP training."""
 
 from .base_motion_dataset import BaseMotionDataset
+from .motion_source import resolve_motion_dir
 from .amp_features import amp_features_to_heading_frame, world_to_heading_frame, amp_features_to_body_frame, world_to_body_frame
 from .motion_dataset import MotionDataset
 from .soma_motion_dataset import SomaMotionDataset
 from .variable_dof_motion_dataset import VariableDofMotionDataset
 
 __all__ = [
-    "BaseMotionDataset", "MotionDataset", "SomaMotionDataset", "VariableDofMotionDataset",
+    "BaseMotionDataset", "MotionDataset", "SomaMotionDataset", "VariableDofMotionDataset", "resolve_motion_dir",
     "amp_features_to_heading_frame", "world_to_heading_frame", "amp_features_to_body_frame", "world_to_body_frame",
 ]
