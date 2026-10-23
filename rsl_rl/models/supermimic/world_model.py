@@ -68,15 +68,16 @@ class SuperMimicWorldModel(nn.Module):
 
     def loss(self, batch: SuperMimicSequenceBatch) -> dict[str, torch.Tensor]:
         """Compute one-step supervised losses over all transitions in a sequence batch."""
-        state = batch.states[:, :-1].reshape(-1, self.state_dim)
-        action = batch.actions.reshape(-1, self.action_dim)
-        context = batch.contexts.reshape(-1, self.context_dim)
-        goal = batch.goals.reshape(-1, self.goal_dim)
+        batch_steps = batch.actions.shape[0] * batch.actions.shape[1]
+        state = batch.states[:, :-1].reshape(batch_steps, self.state_dim)
+        action = batch.actions.reshape(batch_steps, self.action_dim)
+        context = batch.contexts.reshape(batch_steps, self.context_dim)
+        goal = batch.goals.reshape(batch_steps, self.goal_dim)
         predictions = self.predict(state, action, context, goal)
-        next_state = batch.states[:, 1:].reshape(-1, self.state_dim)
-        reward = batch.rewards.reshape(-1, 1)
-        clean_observation = batch.clean_observations[:, 1:].reshape(-1, self.observation_dim)
-        terminated = batch.terminated.reshape(-1, 1).to(dtype=torch.float32)
+        next_state = batch.states[:, 1:].reshape(batch_steps, self.state_dim)
+        reward = batch.rewards.reshape(batch_steps, 1)
+        clean_observation = batch.clean_observations[:, 1:].reshape(batch_steps, self.observation_dim)
+        terminated = batch.terminated.reshape(batch_steps, 1).to(dtype=torch.float32)
         state_loss = F.mse_loss(predictions["next_state"], next_state)
         reward_loss = F.mse_loss(predictions["reward"], reward)
         clean_observation_loss = F.mse_loss(predictions["clean_observation"], clean_observation)
