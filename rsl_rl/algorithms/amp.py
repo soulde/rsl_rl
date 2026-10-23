@@ -497,11 +497,16 @@ class AMP(PPO):
         amp_groups = cfg["obs_groups"]["discriminator"]
         amp_dim = sum(obs[group].shape[-1] for group in amp_groups)
 
-        # Load motion dataset from config path
+        # Resolve local paths and optional ModelScope/Hugging Face repository URLs.
         motion_dir = cfg["algorithm"].pop("motion_dir", None)
         if motion_dir is None:
             raise ValueError("AMP requires 'motion_dir' to be specified in algorithm config")
+        from rsl_rl.datasets import resolve_motion_dir
+
+        motion_dir = resolve_motion_dir(motion_dir)
         rsi_motion_dir = cfg["algorithm"].pop("rsi_motion_dir", None)
+        if rsi_motion_dir:
+            rsi_motion_dir = resolve_motion_dir(rsi_motion_dir)
         reference_state_initialization = cfg["algorithm"].pop("reference_state_initialization", False)
         rsi_support_body_boxes = cfg["algorithm"].pop("rsi_support_body_boxes", None)
         rsi_support_clearance = cfg["algorithm"].pop("rsi_support_clearance", 0.005)
@@ -528,7 +533,10 @@ class AMP(PPO):
 
         motion_dataset_class = resolve_motion_dataset_class(cfg["algorithm"])
         rsi_joint_names = cfg["algorithm"].pop("rsi_joint_names", None)
-        dataset_options = {}
+        dataset_options = {
+            "amp_coordinate_frame": cfg["algorithm"].pop("amp_coordinate_frame", "world"),
+            "marker_body_points": cfg["algorithm"].pop("marker_body_points", None),
+        }
         if rsi_joint_names is not None:
             from rsl_rl.datasets import VariableDofMotionDataset
 

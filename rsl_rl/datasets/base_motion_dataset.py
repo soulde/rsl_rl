@@ -10,9 +10,11 @@ import re
 import torch
 from abc import ABC, abstractmethod
 
+from .amp_features import amp_features_to_heading_frame, amp_features_to_body_frame
+
 
 class BaseMotionDataset(ABC):
-    """NPZ motion pipeline with one world-axis AMP feature layout.
+    """NPZ motion pipeline with a shared world- or heading-axis AMP feature layout.
 
     Features concatenate root linear/angular velocity, joint position/velocity,
     and root-relative key-point positions, in that order. Loaded quaternions
@@ -35,10 +37,16 @@ class BaseMotionDataset(ABC):
         motion_file_pattern: str | None = None,
         motion_files: list[str] | None = None,
         require_transitions: bool = True,
+        amp_coordinate_frame: str = "world",
+        marker_body_points: dict | None = None,
     ):
+        if amp_coordinate_frame not in ("world", "heading", "body"):
+            raise ValueError("amp_coordinate_frame must be 'world', 'heading', or 'body'")
+        self.amp_coordinate_frame = amp_coordinate_frame
         self.device = device
         self.amp_observation_dim = amp_observation_dim
         self.time_between_frames = time_between_frames
+        self.marker_body_points = marker_body_points or {}
         self.key_body_names = key_body_names
         self.joint_names = joint_names
         self.require_transitions = require_transitions
@@ -87,6 +95,16 @@ class BaseMotionDataset(ABC):
             self.key_body_indices = [self.body_names.index(name) for name in self.key_body_names]
             print(f"[AMP] Key body indices: {self.key_body_indices}")
 
+        self.marker_points = []
+        for name, point in self.marker_body_points.items():
+            body_name = point["body_name"]
+            position = point["position"]
+            if self.body_names is None or body_name not in self.body_names:
+                raise ValueError(f"AMP marker {name} has unknown body: {body_name}")
+            if len(position) != 3 or not np.isfinite(position).all():
+                raise ValueError(f"AMP marker {name} requires a finite 3D local position")
+            self.marker_points.append((self.body_names.index(body_name), position))
+
         self.frame_indices = []
         self.reference_frame_indices = []
         self._reference_state_field_names: tuple[str, ...] = ()
@@ -103,7 +121,7 @@ class BaseMotionDataset(ABC):
 
         num_bodies = self.motions[0]["body_pos_w"].shape[1]
         num_key_bodies = len(self.key_body_indices) if self.key_body_indices is not None else num_bodies
-        expected_dim = self.num_joints + self.motions[0]["joint_vel"].shape[-1] + num_key_bodies * 3 + 6
+        expected_dim = self.num_joints + self.motions[0]["joint_vel"].shape[-1] + (num_key_bodies + len(self.marker_points)) * 3 + 6
         if self.amp_observation_dim is None:
             self.amp_observation_dim = expected_dim
         elif self.amp_observation_dim != expected_dim:
@@ -445,8 +463,18 @@ class BaseMotionDataset(ABC):
             key_body_pos = motion["body_pos_w"]
         # Features use world axes. Positions are relative to the root,
         # while velocities are absolute velocities expressed in world axes.
+        marker_positions = []
+        for body_id, local_position in self.marker_points:
+            q = motion["body_quat_xyzw"][:, body_id]
+            local = q.new_tensor(local_position).expand(q.shape[0], 3)
+            cross = torch.cross(q[:, :3], local, dim=-1)
+            rotated = local + 2.0 * (q[:, 3:] * cross + torch.cross(q[:, :3], cross, dim=-1))
+            marker_positions.append((motion["body_pos_w"][:, body_id] + rotated).unsqueeze(1))
+        # Marker points precede body origins, matching the environment contract.
+        if marker_positions:
+            key_body_pos = torch.cat([*marker_positions, key_body_pos], dim=1)
         body_pos_relative = (key_body_pos - root_pos).flatten(start_dim=1)
-        return torch.cat(
+        features = torch.cat(
             [
                 motion["body_lin_vel_w"][:, 0],
                 motion["body_ang_vel_w"][:, 0],
@@ -456,6 +484,15 @@ class BaseMotionDataset(ABC):
             ],
             dim=-1,
         )
+        if self.amp_coordinate_frame == "body":
+            return amp_features_to_body_frame(
+                features, motion["body_quat_xyzw"][:, 0], joint_pos.shape[-1] + joint_vel.shape[-1]
+            )
+        if self.amp_coordinate_frame == "heading":
+            return amp_features_to_heading_frame(
+                features, motion["body_quat_xyzw"][:, 0], joint_pos.shape[-1] + joint_vel.shape[-1]
+            )
+        return features
 
     def __len__(self):
         return len(self.frame_indices)
