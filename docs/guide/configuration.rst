@@ -58,6 +58,9 @@ The default ``motion_dataset_format="beyondmimic"`` and the ``"soma"`` loader
 are unchanged. A separate RSI motion directory may still hold a single-frame
 record using the same schema.
 
+SuperMimic configuration and the required Isaac Lab reference-reset protocol
+are described in :doc:`supermimic`.
+
 RSL-RL is configured with a dictionary that is passed to RSL-RL's runner during initialization. The dictionary is
 usually read from a YAML file or constructed from Python dataclasses, such as in 
 `Isaac Lab <https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_rl/isaaclab_rl/rsl_rl/rl_cfg.py>`__. 

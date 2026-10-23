@@ -28,6 +28,23 @@ class OffPolicyRunner:
         obs = self.env.get_observations()
         algorithm_class = resolve_callable(self.cfg["algorithm"]["class_name"])
         self.alg = algorithm_class.construct_algorithm(obs, self.env, self.cfg, self.device)
+        if getattr(self.alg, "requires_reference_state_initialization", False):
+            task = getattr(self.env, "unwrapped", None)
+            reset = getattr(self.env, "reset", None)
+            sample_rsi = getattr(self.alg, "sample_rsi", None)
+            get_layout = getattr(self.alg, "get_rsi_joint_layout", None)
+            if task is None or not callable(reset):
+                raise RuntimeError(
+                    "SuperMimic requires an Isaac Lab task exposing env.unwrapped and reset() for reference-state initialization"
+                )
+            if not callable(sample_rsi) or not callable(get_layout):
+                raise RuntimeError(
+                    "Reference-state initialization requires sample_rsi() and get_rsi_joint_layout() APIs"
+                )
+            task._supermimic_rsi_sampler = sample_rsi
+            task._supermimic_rsi_joint_layout = get_layout()
+            task._supermimic_num_reference_bins = int(self.alg.sampler.num_bins)
+            reset()
         self.logger = Logger(
             log_dir=log_dir,
             cfg=self.cfg,

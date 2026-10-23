@@ -1,6 +1,8 @@
 """Tests for off-policy algorithm orchestration through the native runner API."""
 
 import torch
+import pytest
+from types import SimpleNamespace
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -111,6 +113,52 @@ def test_runner_save_load_and_inference_policy(tmp_path, monkeypatch) -> None:
     assert runner.current_learning_iteration == 7
     assert runner.alg.training_mode is False
     assert isinstance(policy, _Policy)
+
+
+class _ReferenceAlgorithm(_Algorithm):
+    requires_reference_state_initialization = True
+
+    def __init__(self):
+        super().__init__()
+        self.sampler = SimpleNamespace(num_bins=7)
+
+    def sample_rsi(self, env_ids):
+        return {"joint_pos": torch.zeros(env_ids.numel(), 1)}, torch.zeros_like(env_ids)
+
+    def get_rsi_joint_layout(self):
+        return {"joint_names": ("hip",)}
+
+
+class _ReferenceEnv(_Env):
+    def __init__(self):
+        super().__init__()
+        self.unwrapped = self
+        self.reset_called = False
+        self.reset_saw_sampler = False
+
+    def reset(self):
+        self.reset_called = True
+        self.reset_saw_sampler = callable(getattr(self, "_supermimic_rsi_sampler", None))
+
+
+def test_runner_injects_supermimic_sampler_before_initial_reset(monkeypatch) -> None:
+    from rsl_rl.runners import off_policy_runner
+
+    monkeypatch.setattr(off_policy_runner, "resolve_callable", lambda name: _ReferenceAlgorithm)
+    runner = OffPolicyRunner(_ReferenceEnv(), _cfg(), log_dir=None, device="cpu")
+
+    assert callable(runner.env._supermimic_rsi_sampler)
+    assert runner.env._supermimic_rsi_joint_layout == {"joint_names": ("hip",)}
+    assert runner.env.reset_called and runner.env.reset_saw_sampler
+
+
+def test_runner_rejects_reference_sampler_algorithm_without_task_reset_protocol(monkeypatch) -> None:
+    from rsl_rl.runners import off_policy_runner
+
+    monkeypatch.setattr(off_policy_runner, "resolve_callable", lambda name: _ReferenceAlgorithm)
+
+    with pytest.raises(RuntimeError, match="unwrapped.*reset"):
+        OffPolicyRunner(_Env(), _cfg(), log_dir=None, device="cpu")
 
 
 class _NativeEnv(_Env):
