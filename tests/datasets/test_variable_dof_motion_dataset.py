@@ -92,6 +92,31 @@ def test_single_frame_rsi_uses_same_full_state_decoder(tmp_path):
     assert dataset.sample_reference_states(0)["joint_pos"].shape == (0, 6)
 
 
+def test_reference_state_sampler_selects_one_second_motion_bins(tmp_path):
+    write_motion(
+        tmp_path / "motion.npz",
+        joint_pos=np.stack(
+            [np.ones(100), np.tile([1.0, 0.0, 0.0, 0.0], (100, 1)).T[0],
+             np.tile([1.0, 0.0, 0.0, 0.0], (100, 1)).T[1],
+             np.tile([1.0, 0.0, 0.0, 0.0], (100, 1)).T[2],
+             np.tile([1.0, 0.0, 0.0, 0.0], (100, 1)).T[3], np.arange(100)], axis=1
+        ).astype(np.float32),
+        joint_vel=np.zeros((100, 5), dtype=np.float32),
+        body_pos_w=np.tile(np.array([[10, 0, 1], [10, 0, 0]], dtype=np.float32), (100, 1, 1)),
+        body_quat_w=np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (100, 2, 1)),
+        body_lin_vel_w=np.zeros((100, 2, 3), dtype=np.float32),
+        body_ang_vel_w=np.zeros((100, 2, 3), dtype=np.float32),
+    )
+    dataset = load(tmp_path)
+
+    first = dataset.sample_reference_states_by_bin(torch.zeros(64, dtype=torch.long))
+    second = dataset.sample_reference_states_by_bin(torch.ones(64, dtype=torch.long))
+
+    assert torch.all((first["joint_pos"][:, -1] >= 0) & (first["joint_pos"][:, -1] < 50))
+    assert torch.all((second["joint_pos"][:, -1] >= 50) & (second["joint_pos"][:, -1] < 100))
+    assert first["joint_names"] == ["hip", "rod", "ankle"]
+
+
 @pytest.mark.parametrize(
     "changes,match",
     [

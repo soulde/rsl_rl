@@ -164,3 +164,6 @@ class VariableDofMotionDataset(BaseMotionDataset):
 
     def sample_reference_states(self, batch_size):
         return self._with_joint_contract(super().sample_reference_states(batch_size))
+
+    def sample_reference_states_by_bin(self, bin_ids):
+        return self._with_joint_contract(super().sample_reference_states_by_bin(bin_ids))

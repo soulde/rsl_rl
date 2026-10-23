@@ -107,6 +107,7 @@ class BaseMotionDataset(ABC):
 
         self.frame_indices = []
         self.reference_frame_indices = []
+        self.reference_bins: list[list[tuple[int, int]]] = []
         self._reference_state_field_names: tuple[str, ...] = ()
         self._validation_applied = False
         for motion_idx, motion in enumerate(self.motions):
@@ -116,6 +117,12 @@ class BaseMotionDataset(ABC):
             if self.require_transitions and num_frames < 2:
                 raise ValueError(f"AMP motion {motion_idx} must contain at least two frames")
             self.reference_frame_indices.extend((motion_idx, frame_idx) for frame_idx in range(num_frames))
+            frames_per_second = float(motion["fps"])
+            motion_bin_count = int(np.ceil(num_frames / frames_per_second))
+            for bin_index in range(motion_bin_count):
+                start_frame = int(np.floor(bin_index * frames_per_second))
+                end_frame = min(int(np.floor((bin_index + 1) * frames_per_second)), num_frames)
+                self.reference_bins.append([(motion_idx, frame_idx) for frame_idx in range(start_frame, end_frame)])
             for frame_idx in range(num_frames - 1):
                 self.frame_indices.append((motion_idx, frame_idx))
 
@@ -360,6 +367,28 @@ class BaseMotionDataset(ABC):
             len(self.reference_frame_indices), (batch_size,), device=self.motions[0]["joint_pos"].device
         )
         selected_frames = [self.reference_frame_indices[index] for index in selected_ids.cpu().tolist()]
+        return self._decode_reference_states(selected_frames)
+
+    def sample_reference_states_by_bin(self, bin_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Sample an aligned reset state uniformly within each one-second motion bin."""
+        bin_ids = torch.as_tensor(bin_ids, device=self.motions[0]["joint_pos"].device, dtype=torch.long)
+        if bin_ids.ndim != 1:
+            raise ValueError("AMP reference bin IDs must be one-dimensional")
+        if bin_ids.numel() == 0:
+            return self.sample_reference_states(0)
+        if (bin_ids < 0).any() or (bin_ids >= len(self.reference_bins)).any():
+            raise ValueError(f"AMP reference bin IDs must be in [0, {len(self.reference_bins)})")
+        selected_frames = []
+        for bin_id in bin_ids.cpu().tolist():
+            frames = self.reference_bins[bin_id]
+            if not frames:
+                raise RuntimeError(f"AMP reference bin {bin_id} contains no frames")
+            selected_frames.append(frames[int(torch.randint(len(frames), ()).item())])
+        return self._decode_reference_states(selected_frames)
+
+    def _decode_reference_states(self, selected_frames: list[tuple[int, int]]) -> dict[str, torch.Tensor]:
+        """Decode aligned reset fields for the selected motion/frame pairs."""
+        batch_size = len(selected_frames)
         state_fields = {
             "joint_pos": (self.reference_joint_pos_field, None),
             "joint_vel": (self.reference_joint_vel_field, None),
@@ -382,8 +411,8 @@ class BaseMotionDataset(ABC):
             grouped_frames.setdefault(motion_index, []).append((output_index, frame_index))
         for motion_index, frame_pairs in grouped_frames.items():
             motion = self.motions[motion_index]
-            output_ids = torch.tensor([pair[0] for pair in frame_pairs], device=selected_ids.device)
-            frame_ids = torch.tensor([pair[1] for pair in frame_pairs], device=selected_ids.device)
+            output_ids = torch.tensor([pair[0] for pair in frame_pairs], device=self.motions[0]["joint_pos"].device)
+            frame_ids = torch.tensor([pair[1] for pair in frame_pairs], device=self.motions[0]["joint_pos"].device)
             for output_name, (motion_field, body_index) in state_fields.items():
                 source = motion[motion_field][frame_ids]
                 if body_index is not None:
