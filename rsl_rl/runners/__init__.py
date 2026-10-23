@@ -5,13 +5,10 @@
 
 """Runners for environment-agent interaction."""
 
-from .on_policy_runner import OnPolicyRunner  # noqa: I001
-from .distillation_runner import DistillationRunner
-from .dagger_runner import DaggerRunner
 from .dagger_on_policy_runner import DaggerOnPolicyRunner
+from .dagger_runner import DaggerRunner
+from .distillation_runner import DistillationRunner
 from .off_policy_runner import OffPolicyRunner
+from .on_policy_runner import OnPolicyRunner
 
 __all__ = ["DaggerOnPolicyRunner", "DaggerRunner", "DistillationRunner", "OffPolicyRunner", "OnPolicyRunner"]
-from .off_policy_runner import OffPolicyRunner
-
-__all__ = ["DaggerRunner", "DistillationRunner", "OffPolicyRunner", "OnPolicyRunner"]
