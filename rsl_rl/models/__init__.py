@@ -11,6 +11,7 @@ from .fast_sac import DistributionalCritic, FastSACActor, FastSACPolicy
 from .mlp_model import MLPModel
 from .rnn_model import RNNModel
 from .tdmpc2 import TDMPC2WorldModel
+from .supermimic import SuperMimicActor, SuperMimicCritic, SuperMimicWorldModel
 from .transformer_model import TransformerModel
 from .vae import ConditionalVAE, VAEOutput
 
@@ -25,6 +26,9 @@ __all__ = [
     "MLPModel",
     "RNNModel",
     "TDMPC2WorldModel",
+    "SuperMimicActor",
+    "SuperMimicCritic",
+    "SuperMimicWorldModel",
     "TransformerModel",
     "VAEOutput",
 ]
