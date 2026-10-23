@@ -42,8 +42,11 @@ class SuperMimicReplayBuffer:
         "context",
         "goal",
         "reference_bin_id",
+        "reference_motion_id",
+        "reference_frame_id",
         "ep_step",
     )
+    _OPTIONAL_FIELDS = ("reference_motion_id", "reference_frame_id")
 
     def __init__(
         self,
@@ -72,14 +75,17 @@ class SuperMimicReplayBuffer:
         """Write one vectorized simulator step, with leading dimension `num_envs`."""
         # Episode step is derived locally so callers cannot accidentally carry
         # a stale counter across vectorized resets.
-        missing = (set(self._FIELDS) - {"ep_step"}) - transition.keys()
+        missing = (set(self._FIELDS) - set(self._OPTIONAL_FIELDS) - {"ep_step"}) - transition.keys()
         if missing:
             raise ValueError(f"SuperMimic replay transition is missing fields: {sorted(missing)}")
-        values = {
-            key: torch.as_tensor(transition[key], device=self.device).detach()
-            for key in self._FIELDS
-            if key != "ep_step"
-        }
+        values = {}
+        for key in self._FIELDS:
+            if key == "ep_step":
+                continue
+            if key in transition:
+                values[key] = torch.as_tensor(transition[key], device=self.device).detach()
+            elif key in self._OPTIONAL_FIELDS:
+                values[key] = torch.full((self.num_envs,), -1, dtype=torch.long, device=self.device)
         values["ep_step"] = self.episode_steps.clone().to(torch.int32)
         for key, value in values.items():
             if value.ndim == 0 or value.shape[0] != self.num_envs:
@@ -88,9 +94,10 @@ class SuperMimicReplayBuffer:
             values[key] = values[key].to(torch.float32).reshape(self.num_envs)
         for key in ("terminated", "done"):
             values[key] = values[key].to(torch.bool).reshape(self.num_envs)
-        values["reference_bin_id"] = values["reference_bin_id"].to(torch.long).reshape(self.num_envs)
+        for key in ("reference_bin_id", *self._OPTIONAL_FIELDS):
+            values[key] = values[key].to(torch.long).reshape(self.num_envs)
         for key in self._FIELDS:
-            if key not in {"reward", "terminated", "done", "reference_bin_id", "ep_step"}:
+            if key not in {"reward", "terminated", "done", "reference_bin_id", *self._OPTIONAL_FIELDS, "ep_step"}:
                 values[key] = values[key].to(torch.float32)
         if not self.data:
             self.data = {
@@ -160,6 +167,8 @@ class SuperMimicReplayBuffer:
                 "goal",
                 "a_prev",
                 "reference_bin_id",
+                "reference_motion_id",
+                "reference_frame_id",
                 "ep_step",
             )
         }
@@ -171,7 +180,17 @@ class SuperMimicReplayBuffer:
         history_envs = env_ids[:, None].expand_as(history_rows)
         history = {
             key: self.data[key][history_rows, history_envs]
-            for key in ("observation", "clean_observation", "a_prev", "context", "goal", "reference_bin_id", "ep_step")
+            for key in (
+                "observation",
+                "clean_observation",
+                "a_prev",
+                "context",
+                "goal",
+                "reference_bin_id",
+                "reference_motion_id",
+                "reference_frame_id",
+                "ep_step",
+            )
         }
         return starts, history
 
@@ -197,6 +216,9 @@ class SuperMimicReplayBuffer:
         self.num_episodes = int(state_dict["num_episodes"])
         self.episode_steps = state_dict["episode_steps"].to(self.device)
         self.data = {key: value.to(self.device) for key, value in state_dict["data"].items()}
+        for key in self._OPTIONAL_FIELDS:
+            if key not in self.data:
+                self.data[key] = torch.full((self.capacity, self.num_envs), -1, dtype=torch.long, device=self.device)
 
     def _row(self, age: torch.Tensor) -> torch.Tensor:
         return (self.ptr - self.size + age) % self.capacity

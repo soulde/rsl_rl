@@ -112,6 +112,34 @@ def test_autoreset_keeps_terminal_transition_and_reset_history_separate() -> Non
     torch.testing.assert_close(algorithm._obs_history[0], reset_obs["policy"][0].expand(10, -1))
 
 
+def test_imagined_rollout_queries_task_goal_for_each_reference_frame() -> None:
+    cfg = _cfg()
+    cfg["obs_groups"]["goal"] = ["goal_features"]
+    initial_obs = _obs()
+    initial_obs["goal_features"] = torch.zeros(2, 1)
+    algorithm = SuperMimic.construct_algorithm(initial_obs, _Env(), cfg, "cpu")
+    calls = []
+
+    def provide_goals(motion_ids, frame_ids, count):
+        calls.append((motion_ids.clone(), frame_ids.clone(), count))
+        return torch.arange(count, dtype=torch.float32)[..., None, None].expand(count, motion_ids.numel(), 1)
+
+    algorithm.set_goal_provider(provide_goals)
+    for step in range(3):
+        obs = _obs()
+        obs["goal_features"] = torch.zeros(2, 1)
+        obs["reference_motion_id"] = torch.tensor([4, 7])
+        obs["reference_frame_id"] = torch.tensor([step, step + 10])
+        algorithm.act(obs)
+        algorithm.process_env_step(obs, torch.ones(2), torch.zeros(2, dtype=torch.bool), {})
+
+    metrics = algorithm.update()
+
+    assert calls and calls[0][2] == algorithm.horizon + 1
+    assert set(metrics) >= {"actor_loss", "critic_loss"}
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+
+
 def test_construct_allows_pre_reset_observation_but_act_requires_reset_bin_id() -> None:
     observation = TensorDict(
         {"policy": torch.zeros(2, 4), "state": torch.zeros(2, 5), "clean": torch.zeros(2, 4)},

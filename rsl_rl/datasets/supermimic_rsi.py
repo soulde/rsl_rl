@@ -49,8 +49,37 @@ class ReturnAwareReferenceSampler:
         self.historical_weights.mul_(0.999).add_(soft, alpha=0.001)
         self._probabilities = self._build_probabilities(soft)
         bin_ids = torch.multinomial(self._probabilities, int(env_ids.numel()), replacement=True)
-        states = self.dataset.sample_reference_states_by_bin(bin_ids)
+        states = self._sample_states(bin_ids)
         return states, bin_ids
+
+    def _sample_states(self, bin_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Sample states and retain their source frame when the dataset exposes bins."""
+        # The base dataset API intentionally returns just state tensors. RSI
+        # needs the selected clip/frame as well so the task can keep tracking
+        # the same motion after applying the sampled reset state.
+        reference_bins = getattr(self.dataset, "reference_bins", None)
+        decode = getattr(self.dataset, "_decode_reference_states", None)
+        if reference_bins is None or decode is None:
+            return self.dataset.sample_reference_states_by_bin(bin_ids)
+
+        selected_frames = []
+        for bin_id in bin_ids.cpu().tolist():
+            frames = reference_bins[bin_id]
+            if not frames:
+                raise RuntimeError(f"RSI reference bin {bin_id} contains no frames")
+            frame_index = int(torch.randint(len(frames), ()).item())
+            selected_frames.append(frames[frame_index])
+        states = decode(selected_frames)
+        with_joint_contract = getattr(self.dataset, "_with_joint_contract", None)
+        if with_joint_contract is not None:
+            states = with_joint_contract(states)
+        states["reference_motion_ids"] = torch.tensor(
+            [motion_id for motion_id, _ in selected_frames], dtype=torch.long, device=self.device
+        )
+        states["reference_frame_ids"] = torch.tensor(
+            [frame_id for _, frame_id in selected_frames], dtype=torch.long, device=self.device
+        )
+        return states
 
     def update_returns(self, bin_ids: torch.Tensor, episode_returns: torch.Tensor) -> None:
         bin_ids = torch.as_tensor(bin_ids, device=self.device, dtype=torch.long).reshape(-1)

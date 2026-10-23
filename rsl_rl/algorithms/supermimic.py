@@ -38,6 +38,7 @@ class SuperMimic:
         lr: float = 2e-4,
         grad_clip_norm: float = 1.0,
         action_noise: float = 0.1,
+        goal_provider=None,
     ) -> None:
         if batch_size <= 0 or horizon <= 0 or gradient_steps <= 0 or train_every <= 0:
             raise ValueError("SuperMimic batch size, horizon, gradient steps, and train_every must be positive")
@@ -46,6 +47,7 @@ class SuperMimic:
         self.device = torch.device(device)
         self.model, self.actor, self.critic = model.to(device), actor.to(device), critic.to(device)
         self.replay_buffer, self.sampler = replay_buffer, sampler
+        self.goal_provider = goal_provider
         self.obs_groups = obs_groups
         self.batch_size = batch_size
         self.horizon, self.gamma, self.gae_lambda = horizon, gamma, gae_lambda
@@ -75,6 +77,8 @@ class SuperMimic:
         context = self._extract(obs, "context")
         goal = self._extract(obs, "goal")
         bin_ids = obs["reference_bin_id"].to(self.device, dtype=torch.long).reshape(-1)
+        motion_ids = obs.get("reference_motion_id")
+        frame_ids = obs.get("reference_frame_id")
         if self._episode_returns is None or self._episode_returns.shape[0] != actor_obs.shape[0]:
             self._episode_returns = torch.zeros(actor_obs.shape[0], device=self.device)
         if self._obs_history is None or self._obs_history.shape[0] != actor_obs.shape[0]:
@@ -97,6 +101,16 @@ class SuperMimic:
             "context": context.detach(),
             "goal": goal.detach(),
             "reference_bin_id": bin_ids.detach(),
+            "reference_motion_id": (
+                torch.full_like(bin_ids, -1)
+                if motion_ids is None
+                else motion_ids.to(self.device, dtype=torch.long).reshape(-1)
+            ),
+            "reference_frame_id": (
+                torch.full_like(bin_ids, -1)
+                if frame_ids is None
+                else frame_ids.to(self.device, dtype=torch.long).reshape(-1)
+            ),
             "action": actions.detach(),
             "a_prev": self._previous_actions.detach(),
         }
@@ -189,12 +203,25 @@ class SuperMimic:
         policy_history = history["clean_observation"]
         policy_obs = policy_history[:, -1]
         context, goal = starts["context"], starts["goal"]
+        has_reference_ids = (starts["reference_motion_id"] >= 0).all() and (starts["reference_frame_id"] >= 0).all()
+        if self.goal_provider is not None and self.actor.goal_dim and has_reference_ids:
+            goal_sequence = self.goal_provider(
+                starts["reference_motion_id"], starts["reference_frame_id"], self.horizon + 1
+            )
+            goal_sequence = torch.as_tensor(goal_sequence, device=self.device, dtype=goal.dtype)
+            expected_shape = (self.horizon + 1, state.shape[0], self.actor.goal_dim)
+            if tuple(goal_sequence.shape) != expected_shape:
+                raise ValueError(f"SuperMimic goal provider must return shape {expected_shape}")
+        else:
+            goal_sequence = goal.unsqueeze(0).expand(self.horizon + 1, -1, -1)
         survival = torch.ones(state.shape[0], 1, device=self.device)
-        observations, rewards, terminals = [], [], []
+        observations, rewards, terminals, goal_windows = [], [], [], []
         actor_return = torch.zeros_like(survival)
         discount = 1.0
-        for _ in range(self.horizon):
+        for step in range(self.horizon):
+            goal = goal_sequence[step]
             observations.append(policy_obs)
+            goal_windows.append(goal)
             action = self.actor(policy_history, goal if self.actor.goal_dim else None)
             prediction = self.model.predict(state, action, context, goal)
             reward = prediction["reward"]
@@ -207,6 +234,7 @@ class SuperMimic:
             policy_obs = prediction["clean_observation"]
             policy_history = torch.cat((policy_history[:, 1:], policy_obs[:, None]), dim=1)
             discount *= self.gamma
+        goal = goal_sequence[-1]
         actor_return = actor_return + discount * survival * self.critic(
             torch.cat((policy_obs, goal), dim=-1) if self.actor.goal_dim else policy_obs
         )
@@ -218,7 +246,8 @@ class SuperMimic:
 
         with torch.no_grad():
             values = torch.stack([
-                self.critic(torch.cat((item, goal), dim=-1) if self.actor.goal_dim else item) for item in observations
+                self.critic(torch.cat((item, goal_t), dim=-1) if self.actor.goal_dim else item)
+                for item, goal_t in zip(observations, goal_windows, strict=True)
             ])
             last_value = self.critic(torch.cat((policy_obs, goal), dim=-1) if self.actor.goal_dim else policy_obs)
             advantages, returns = self.compute_gae(
@@ -227,8 +256,8 @@ class SuperMimic:
         for parameter in self.critic.parameters():
             parameter.requires_grad_(True)
         critic_values = torch.stack([
-            self.critic(torch.cat((item.detach(), goal), dim=-1) if self.actor.goal_dim else item.detach())
-            for item in observations
+            self.critic(torch.cat((item.detach(), goal_t), dim=-1) if self.actor.goal_dim else item.detach())
+            for item, goal_t in zip(observations, goal_windows, strict=True)
         ])
         critic_loss = F.mse_loss(critic_values, returns)
         self.critic_optimizer.zero_grad(set_to_none=True)
@@ -256,6 +285,12 @@ class SuperMimic:
     def sample_rsi(self, env_ids: torch.Tensor):
         """Sample aligned reset state and bin IDs for the Isaac Lab task."""
         return self.sampler.sample_reference_states(env_ids)
+
+    def set_goal_provider(self, goal_provider) -> None:
+        """Install the task's reference-goal lookup used during imagined rollouts."""
+        if goal_provider is not None and not callable(goal_provider):
+            raise TypeError("SuperMimic goal_provider must be callable")
+        self.goal_provider = goal_provider
 
     def get_rsi_joint_layout(self) -> dict:
         dataset = self.sampler.dataset
@@ -337,6 +372,7 @@ class SuperMimic:
         sampler = ReturnAwareReferenceSampler(
             dataset, len(dataset.reference_bins), max_return=1.0 / max(1e-6, 1.0 - gamma)
         )
+        goal_provider = getattr(task, "_supermimic_goal_provider", None)
         memory = cfg.get("memory", {})
         model = SuperMimicWorldModel(
             dims["state"],
@@ -373,6 +409,7 @@ class SuperMimic:
             groups,
             batch_size,
             device,
+            goal_provider=goal_provider,
             **{
                 key: value
                 for key, value in algorithm_cfg.items()

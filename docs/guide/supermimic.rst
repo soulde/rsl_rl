@@ -26,6 +26,16 @@ them in a top-level scalar-per-environment observation named
 ``reference_bin_id``. Keep this field in every observation until the next
 reset; the trainer uses it to associate episode returns with reset bins.
 SuperMimic requires this contract and raises an error if the field is missing.
+The sampled state dictionary also includes ``reference_motion_ids`` and
+``reference_frame_ids``. Tasks using reference goals can expose them in each
+observation as ``reference_motion_id`` and ``reference_frame_id``.
+
+For imagined rollouts with time-varying reference goals, define
+``task._supermimic_goal_provider(motion_ids, frame_ids, count)`` before creating
+the runner. It must return goals with shape ``[count, batch, goal_dim]``;
+``count`` is ``horizon + 1`` so the critic also receives the final goal.
+Without this optional hook, the trainer holds the sampled goal constant over
+the imagined rollout.
 
 .. code-block:: python
 

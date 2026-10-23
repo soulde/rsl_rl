@@ -44,6 +44,9 @@ class OffPolicyRunner:
             task._supermimic_rsi_sampler = sample_rsi
             task._supermimic_rsi_joint_layout = get_layout()
             task._supermimic_num_reference_bins = int(self.alg.sampler.num_bins)
+            set_goal_provider = getattr(self.alg, "set_goal_provider", None)
+            if callable(set_goal_provider):
+                set_goal_provider(getattr(task, "_supermimic_goal_provider", None))
             reset()
         self.logger = Logger(
             log_dir=log_dir,
