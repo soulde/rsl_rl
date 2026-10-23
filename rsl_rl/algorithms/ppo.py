@@ -352,9 +352,9 @@ class PPO:
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            self._clip_gradients()
             self.optimizer.step()
+            self._after_optimizer_step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -425,6 +425,15 @@ class PPO:
     def _should_adapt_learning_rate(self) -> bool:
         """Whether the adaptive KL schedule should update the optimizer learning rate."""
         return True
+
+    def _clip_gradients(self) -> None:
+        """Clip actor and critic gradients independently."""
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+
+    def _after_optimizer_step(self) -> None:
+        """Hook for algorithm-specific post-update state changes."""
+        pass
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""
