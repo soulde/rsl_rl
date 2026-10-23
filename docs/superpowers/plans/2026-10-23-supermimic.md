@@ -23,7 +23,7 @@
 
 - Autoreset environments can supply final observations and immediate reset observations; test replay uses the final state for transition learning and reset state for the next episode.
 - Episode windows must never cross termination or timeout boundaries; test both terminal and truncated episode closure.
-- Missing or malformed reference-bin IDs must fail clearly because the algorithm requires the task protocol; test constructor and transition validation.
+- Missing or malformed reference-bin IDs must fail clearly because the algorithm requires the task protocol; permit pre-reset construction, then test that the first `act` after runner reset validates the ID.
 - Imagined actor gradients must flow through frozen world-model operations without changing world-model weights; test actor gradient and parameter immutability.
 - Return-aware sampling must handle equal returns, unobserved bins, and zero mixture components without NaN probabilities; test normalized finite distributions and returned bin IDs.
 
@@ -41,16 +41,16 @@
 - Test: `tests/datasets/test_supermimic_rsi.py`
 
 **Interfaces:**
-- Produce `SuperMimicReplayBuffer(capacity, sequence_length, batch_size, device)` with `add_step(env_id, transition)`, `end_episode(env_id)`, `sample() -> SuperMimicSequenceBatch`, `state_dict()`, and `load_state_dict(state_dict)`.
-- `SuperMimicSequenceBatch` contains `[B,T+1,D]` states/observations/clean observations, `[B,T,...]` actions/rewards/terminated/context/goals/bin IDs.
+- Produce `SuperMimicReplayBuffer(capacity, num_envs, sequence_length, batch_size, history_length, device)` with `add(transition_batch)`, `sample_windows() -> SuperMimicSequenceBatch`, `sample_starts() -> (start_batch, history_batch)`, `state_dict()`, and `load_state_dict(state_dict)`.
+- The replay is a time-major ring `[capacity, num_envs, ...]`; batches carry `[B,T,...]` fields plus a mask that becomes zero after an episode boundary. Start sampling returns a history window that repeats the episode's first transition if less than `history_length` history is available.
 - Add `BaseMotionDataset.sample_reference_states_by_bin(bin_ids) -> dict[str, Tensor]`, where bins are one-second motion intervals and sampled frame offsets are uniform within each selected interval.
-- Produce `ReturnAwareReferenceSampler(dataset, num_bins, uniform_fraction=0.5, low_return_fraction=0.4, historical_fraction=0.1, temperature=25.0)` with `sample_reference_states(env_ids) -> (state_dict, bin_ids)`, `update_returns(bin_ids, episode_returns)`, and serializable state.
+- Produce `ReturnAwareReferenceSampler(dataset, num_bins, uniform_fraction=0.5, low_return_fraction=0.4, historical_fraction=0.1, temperature=25.0, max_return=...)` with `sample_reference_states(env_ids) -> (state_dict, bin_ids)`, EMA `update_returns(bin_ids, episode_returns)`, a historical softmax-weight EMA updated on every sample call, and serializable state.
 
-- [ ] **Step 1: Write failing replay tests** for per-env append, complete-window sampling, no boundary crossing, FIFO capacity, timeout closure, and state-dict round trip.
+- [ ] **Step 1: Write failing replay tests** for time-major append, masked windows across done, clamped observation history, FIFO capacity, and state-dict round trip.
 - [ ] **Step 2: Run** `pytest tests/storage/test_supermimic_replay_buffer.py -q`; expect failures because the module does not exist.
-- [ ] **Step 3: Implement** transition validation, per-env episode staging, bounded complete-episode replay, fixed-length sampling, and serialization.
+- [ ] **Step 3: Implement** fixed-size time-major storage, ring indexing, window masks, history-clamped start sampling, and serialization.
 - [ ] **Step 4: Run** `pytest tests/storage/test_supermimic_replay_buffer.py -q`; expect all tests to pass.
-- [ ] **Step 5: Write failing sampler tests** for aligned returned states/bin IDs, default 50/40/10 mixture, finite normalized probabilities with equal/unobserved returns, updates, and checkpoint round trip.
+- [ ] **Step 5: Write failing sampler tests** for aligned returned states/bin IDs, exact 50/40/10 mixture formula, finite normalized probabilities with equal/unobserved returns, return EMA, historical-weight EMA, and checkpoint round trip.
 - [ ] **Step 6: Run** `pytest tests/datasets/test_supermimic_rsi.py -q`; expect failures because sampler is absent.
 - [ ] **Step 7: Implement** one-second interval indexing and `sample_reference_states_by_bin` in `BaseMotionDataset`, preserving aligned root/joint/reference fields and existing RSI frame filtering.
 - [ ] **Step 8: Implement** weighted bin selection and delegate selected-bin frame sampling to that dataset method.
@@ -69,7 +69,7 @@
 
 **Interfaces:**
 - `SuperMimicWorldModel(state_dim, action_dim, observation_dim, context_dim=0, goal_dim=0, hidden_dims=(256,256,256))`; `predict(state, action, context, goal) -> dict(next_state, reward, clean_observation, termination_logit)`; `loss(sequence_batch) -> dict[str, Tensor]`.
-- `SuperMimicActor(observation_dim, action_dim, goal_dim=0, hidden_dims=(256,256))`; `forward(observation, goal=None) -> action` bounded to `[-1,1]`.
+- `SuperMimicActor(observation_dim, action_dim, goal_dim=0, history_length=10, hidden_dims=(256,256))`; `forward(observation_history, goal=None) -> deterministic action`.
 - `SuperMimicCritic(input_dim, hidden_dims=(256,256))`; `forward(observation) -> value`.
 
 - [ ] **Step 1: Write failing tests** for output shapes, bounded deterministic actions, each world-model head loss, finite gradients, and serialization.
@@ -86,7 +86,7 @@
 
 **Interfaces:**
 - Implement standard lifecycle `construct_algorithm`, `act`, `process_env_step`, `update`, `train_mode`, `eval_mode`, `get_policy`, `save`, and `load`.
-- Constructor consumes model/actor/critic, replay, sampler, observation-group config, optimizer settings, imagination horizon, gamma, and GAE lambda.
+- Constructor consumes model/actor/critic, replay, sampler, observation-group config, optimizer settings, imagination horizon, observation history, action noise, gamma, and GAE lambda.
 - `update()` returns scalar model/actor/critic loss metrics. During actor updates, world-model parameters have `requires_grad=False`, while autograd through model computations remains enabled.
 
 - [ ] **Step 1: Write failing algorithm tests** for config construction, env collection, reference-bin validation, world-model updates, imagined actor gradients with unchanged model parameters, GAE critic targets, and checkpoint restoration.

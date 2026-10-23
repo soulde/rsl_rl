@@ -40,4 +40,19 @@ def test_sampler_checkpoint_restores_statistics_and_distribution() -> None:
     restored.load_state_dict(state)
 
     assert torch.equal(restored.probabilities, sampler.probabilities)
-    assert torch.equal(restored.return_counts, sampler.return_counts)
+    assert torch.equal(restored.return_estimates, sampler.return_estimates)
+
+
+def test_sampler_matches_reference_return_and_historical_ema() -> None:
+    sampler = ReturnAwareReferenceSampler(_Dataset(), num_bins=4, max_return=100.0)
+    sampler.update_returns(torch.tensor([0, 1]), torch.tensor([10.0, 20.0]))
+
+    expected_returns = torch.tensor([2.0, 4.0, 0.0, 0.0])
+    torch.testing.assert_close(sampler.return_estimates, expected_returns)
+    soft = torch.softmax(-25.0 * expected_returns / 100.0, dim=0)
+    initial_history = torch.full((4,), 0.25)
+    sampler.sample_reference_states(torch.arange(8))
+
+    torch.testing.assert_close(sampler.historical_weights, 0.999 * initial_history + 0.001 * soft)
+    expected = 0.5 * initial_history + 0.4 * soft + 0.1 * sampler.historical_weights / sampler.historical_weights.sum()
+    torch.testing.assert_close(sampler.probabilities, expected)

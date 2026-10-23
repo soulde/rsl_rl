@@ -33,7 +33,9 @@ class SuperMimicWorldModel(nn.Module):
     ) -> None:
         super().__init__()
         if min(state_dim, action_dim, observation_dim) <= 0 or min(context_dim, goal_dim) < 0:
-            raise ValueError("World-model state/action/observation dimensions must be positive; context/goal nonnegative.")
+            raise ValueError(
+                "World-model state/action/observation dimensions must be positive; context/goal nonnegative."
+            )
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.observation_dim = observation_dim
@@ -60,7 +62,9 @@ class SuperMimicWorldModel(nn.Module):
         features = torch.cat((state, action, context, goal), dim=-1)
         latent = self.trunk(features)
         return {
-            "next_state": self.next_state_head(latent),
+            # Residual dynamics make the learned model predict a state delta,
+            # matching the reference implementation and easing long rollouts.
+            "next_state": state + self.next_state_head(latent),
             "reward": self.reward_head(latent),
             "clean_observation": self.clean_observation_head(latent),
             "termination_logit": self.termination_head(latent),
@@ -78,10 +82,18 @@ class SuperMimicWorldModel(nn.Module):
         reward = batch.rewards.reshape(batch_steps, 1)
         clean_observation = batch.clean_observations[:, 1:].reshape(batch_steps, self.observation_dim)
         terminated = batch.terminated.reshape(batch_steps, 1).to(dtype=torch.float32)
-        state_loss = F.mse_loss(predictions["next_state"], next_state)
-        reward_loss = F.mse_loss(predictions["reward"], reward)
-        clean_observation_loss = F.mse_loss(predictions["clean_observation"], clean_observation)
-        termination_loss = F.binary_cross_entropy_with_logits(predictions["termination_logit"], terminated)
+        mask = batch.mask.reshape(batch_steps, 1).to(dtype=state.dtype)
+        denom = mask.sum().clamp_min(1.0)
+
+        def masked_mean(value: torch.Tensor) -> torch.Tensor:
+            return (value * mask).sum() / (denom * value.shape[-1])
+
+        state_loss = masked_mean((predictions["next_state"] - next_state).square())
+        reward_loss = masked_mean((predictions["reward"] - reward).square())
+        clean_observation_loss = masked_mean((predictions["clean_observation"] - clean_observation).square())
+        termination_loss = masked_mean(
+            F.binary_cross_entropy_with_logits(predictions["termination_logit"], terminated, reduction="none")
+        )
         return {
             "total_loss": state_loss + reward_loss + clean_observation_loss + termination_loss,
             "state_loss": state_loss,

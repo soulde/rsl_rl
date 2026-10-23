@@ -15,6 +15,8 @@ def _batch() -> SuperMimicSequenceBatch:
         contexts=torch.randn(3, 3, 2),
         goals=torch.randn(3, 3, 3),
         reference_bin_ids=torch.zeros(3, 3, dtype=torch.long),
+        done=torch.zeros(3, 3, 1, dtype=torch.bool),
+        mask=torch.ones(3, 3),
     )
 
 
@@ -37,14 +39,14 @@ def test_world_model_predicts_each_head_and_has_finite_supervised_gradients() ->
 def test_actor_is_deterministic_and_bounded_and_critic_returns_values() -> None:
     actor = SuperMimicActor(6, 2, goal_dim=3, hidden_dims=(16, 16))
     critic = SuperMimicCritic(9, hidden_dims=(16, 16))
-    observations, goals = torch.randn(5, 6), torch.randn(5, 3)
+    observations, goals = torch.randn(5, 10, 6), torch.randn(5, 3)
 
     actions = actor(observations, goals)
 
     assert actions.shape == (5, 2)
     assert torch.equal(actions, actor(observations, goals))
     assert torch.all(actions.abs() <= 1.0)
-    assert critic(torch.cat((observations, goals), dim=-1)).shape == (5, 1)
+    assert critic(torch.cat((observations[:, -1], goals), dim=-1)).shape == (5, 1)
 
 
 def test_world_model_state_dict_round_trip_preserves_predictions() -> None:

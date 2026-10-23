@@ -12,21 +12,21 @@ Add a native SuperMimic-style model-based imitation learning algorithm to `rsl_r
 
 ## Replay and model data
 
-- Store fixed-size transition sequences with state, policy observation, action, reward, clean observation, termination, context, goal/reference features, and reference-bin ID.
+- Store simulator transitions in a fixed-capacity time-major ring buffer, with a fixed env axis and state, policy observation, previous action, reward, clean observation, termination, done, context, goal/reference features, reference-bin ID, and episode step.
 - Configure dimensions and observation-group mapping explicitly. State and clean-observation targets may be the same tensor when a task has no separate clean target; context and goal may be zero-width when not used by the model.
 - Train the world model to predict next state, reward, clean observation, and termination probability, conditioned on action, context, and goal/reference input.
-- Sample only contiguous windows from the same episode. Store pre-reset terminal observations for autoreset environments.
+- Sample contiguous windows with a validity mask that stops model loss after episode boundaries; sample imagination starts with observation history clamped to the current episode start.
 
 ## Trainer
 
 - Update the supervised world model from replay sequences.
 - Roll out the deterministic policy through the learned model for a configurable horizon. Freeze world-model parameters during policy optimization while preserving gradients through model inputs and predicted states to the actor.
-- Train the actor with survival-weighted imagined returns and train a value critic with bootstrapped GAE targets.
-- Make horizons, batch sizes, loss weights, learning rates, discount, and GAE configurable. Defaults and tests must be CPU-friendly; implementation must not launch a training job.
+- Train a deterministic goal-conditioned actor from a configurable observation-history window. Train the actor with survival-weighted imagined returns and train a value critic with bootstrapped GAE targets.
+- Make horizons, batch sizes, loss weights, learning rates, exploration noise, discount, and GAE configurable. Defaults and tests must be CPU-friendly; implementation must not launch a training job.
 
 ## Isaac Lab reset and domain randomization
 
-- Add a reference-state sampler alongside AMP's uniform RSI sampler. It accepts configurable mixture weights and per-reference-bin return statistics, then samples aligned reset state plus reference-bin ID. Default mixture: 50% uniform bins, 40% softmax of negative normalized return, and 10% proportional to historical softmax weights.
+- Add a reference-state sampler alongside AMP's uniform RSI sampler. It accepts configurable mixture weights and per-reference-bin return estimates, then samples aligned reset state plus reference-bin ID. Default mixture: `0.5 / num_bins + 0.4 * softmax(-25 * bin_return / max_return) + 0.1 * normalized_historical_softmax_weights`; update historical weights by EMA on sampling and bin returns by EMA on episode completion.
 - The runner injects the sampler into the unwrapped Isaac Lab task, following AMP's `_amp_rsi_sampler` pattern. The task calls it during reset, applies the returned state, and publishes the selected reference-bin ID in observations or step extras.
 - SuperMimic requires the reference-bin ID contract and does not fall back to ordinary reset. The trainer accumulates episode returns by reset bin and updates sampler statistics.
 - Simulator-specific domain randomization remains in the Isaac Lab task. Context values affecting dynamics are supplied by the task and stored in replay for model conditioning.

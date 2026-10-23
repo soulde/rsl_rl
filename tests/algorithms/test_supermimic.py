@@ -55,7 +55,9 @@ def _cfg():
         "critic": {"hidden_dims": [16, 16]},
         "memory": {"capacity": 64, "sequence_length": 2, "batch_size": 4},
         "obs_groups": {
-            "actor": ["policy"], "state": ["state"], "clean_observation": ["clean"],
+            "actor": ["policy"],
+            "state": ["state"],
+            "clean_observation": ["clean"],
             "critic": ["policy"],
         },
     }
@@ -64,13 +66,22 @@ def _cfg():
 def test_construct_collects_transitions_and_requires_reference_bin_ids() -> None:
     algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
     actions = algorithm.act(_obs())
-    algorithm.process_env_step(_obs(), torch.ones(2), torch.tensor([False, True]), {"time_outs": torch.tensor([False, True]), "reference_bin_id": torch.tensor([0, 1])})
+    algorithm.process_env_step(
+        _obs(),
+        torch.ones(2),
+        torch.tensor([False, True]),
+        {"time_outs": torch.tensor([False, True]), "reference_bin_id": torch.tensor([0, 1])},
+    )
 
     assert actions.shape == (2, 2)
-    assert algorithm.replay_buffer.size == 2
+    assert algorithm.replay_buffer.size == 1
     assert algorithm.replay_buffer.num_episodes == 1
     with pytest.raises(ValueError, match="reference_bin_id"):
-        algorithm.act(TensorDict({"policy": torch.zeros(2, 4), "state": torch.zeros(2, 5), "clean": torch.zeros(2, 4)}, batch_size=[2]))
+        algorithm.act(
+            TensorDict(
+                {"policy": torch.zeros(2, 4), "state": torch.zeros(2, 5), "clean": torch.zeros(2, 4)}, batch_size=[2]
+            )
+        )
 
 
 def test_construct_rejects_policy_and_clean_observation_dimension_mismatch() -> None:
@@ -81,15 +92,54 @@ def test_construct_rejects_policy_and_clean_observation_dimension_mismatch() -> 
         SuperMimic.construct_algorithm(_obs(), _Env(), cfg, "cpu")
 
 
+def test_autoreset_keeps_terminal_transition_and_reset_history_separate() -> None:
+    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
+    current = _obs()
+    algorithm.act(current)
+    reset_obs = _obs()
+    final_obs = _obs()
+    final_obs["policy"] = torch.full_like(final_obs["policy"], 99.0)
+    final_obs["clean"] = torch.full_like(final_obs["clean"], 99.0)
+
+    algorithm.process_env_step(
+        reset_obs,
+        torch.ones(2),
+        torch.tensor([True, False]),
+        {"final_observation": final_obs, "time_outs": torch.tensor([False, False])},
+    )
+
+    torch.testing.assert_close(algorithm.replay_buffer.data["next_observation"][0, 0], final_obs["policy"][0])
+    torch.testing.assert_close(algorithm._obs_history[0], reset_obs["policy"][0].expand(10, -1))
+
+
+def test_construct_allows_pre_reset_observation_but_act_requires_reset_bin_id() -> None:
+    observation = TensorDict(
+        {"policy": torch.zeros(2, 4), "state": torch.zeros(2, 5), "clean": torch.zeros(2, 4)},
+        batch_size=[2],
+    )
+    algorithm = SuperMimic.construct_algorithm(observation, _Env(), _cfg(), "cpu")
+
+    with pytest.raises(ValueError, match="reference_bin_id"):
+        algorithm.act(observation)
+
+
+def test_act_rejects_out_of_range_reference_bin_id() -> None:
+    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
+    observation = _obs()
+    observation["reference_bin_id"][0] = 2
+
+    with pytest.raises(ValueError, match="reference_bin_id.*range"):
+        algorithm.act(observation)
+
+
 def test_update_trains_model_actor_and_critic_with_finite_losses() -> None:
     algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
     for _ in range(3):
         obs = _obs()
         algorithm.act(obs)
-        algorithm.process_env_step(obs, torch.ones(2), torch.zeros(2, dtype=torch.bool), {"reference_bin_id": obs["reference_bin_id"]})
-    algorithm.replay_buffer.end_episode(0)
-    algorithm.replay_buffer.end_episode(1)
-
+        algorithm.process_env_step(
+            obs, torch.ones(2), torch.zeros(2, dtype=torch.bool), {"reference_bin_id": obs["reference_bin_id"]}
+        )
     metrics = algorithm.update()
 
     assert set(metrics) >= {"model_loss", "actor_loss", "critic_loss"}
@@ -108,12 +158,14 @@ def test_imagined_actor_update_backpropagates_through_frozen_world_model() -> No
             torch.full((2,), step == 2),
             {"reference_bin_id": obs["reference_bin_id"]},
         )
-    batch = algorithm.replay_buffer.sample()
+    batch = algorithm.replay_buffer.sample_windows()
     model_before = [parameter.detach().clone() for parameter in algorithm.model.parameters()]
 
     algorithm._update_imagined_policy(batch)
 
-    assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in algorithm.actor.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in algorithm.actor.parameters()
+    )
     assert all(torch.equal(before, after) for before, after in zip(model_before, algorithm.model.parameters()))
     assert all(parameter.requires_grad for parameter in algorithm.model.parameters())
 

@@ -37,6 +37,7 @@ class SuperMimic:
         train_every: int = 1,
         lr: float = 2e-4,
         grad_clip_norm: float = 1.0,
+        action_noise: float = 0.1,
     ) -> None:
         if batch_size <= 0 or horizon <= 0 or gradient_steps <= 0 or train_every <= 0:
             raise ValueError("SuperMimic batch size, horizon, gradient steps, and train_every must be positive")
@@ -50,6 +51,9 @@ class SuperMimic:
         self.horizon, self.gamma, self.gae_lambda = horizon, gamma, gae_lambda
         self.learning_starts, self.gradient_steps, self.train_every = learning_starts, gradient_steps, train_every
         self.grad_clip_norm = grad_clip_norm
+        if action_noise < 0:
+            raise ValueError("action_noise cannot be negative")
+        self.action_noise = float(action_noise)
         self.model_optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr)
@@ -58,6 +62,9 @@ class SuperMimic:
         self.training = True
         self._transition: dict[str, torch.Tensor] | None = None
         self._episode_returns: torch.Tensor | None = None
+        self._episode_discount: torch.Tensor | None = None
+        self._obs_history: torch.Tensor | None = None
+        self._previous_actions: torch.Tensor | None = None
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Choose a deterministic action and cache the current transition fields."""
@@ -70,11 +77,19 @@ class SuperMimic:
         bin_ids = obs["reference_bin_id"].to(self.device, dtype=torch.long).reshape(-1)
         if self._episode_returns is None or self._episode_returns.shape[0] != actor_obs.shape[0]:
             self._episode_returns = torch.zeros(actor_obs.shape[0], device=self.device)
+        if self._obs_history is None or self._obs_history.shape[0] != actor_obs.shape[0]:
+            self._obs_history = actor_obs[:, None].expand(-1, self.actor.history_length, -1).clone()
+            self._previous_actions = torch.zeros(actor_obs.shape[0], self.actor.action_dim, device=self.device)
+            self._episode_discount = torch.ones(actor_obs.shape[0], device=self.device)
+        else:
+            self._obs_history = torch.cat((self._obs_history[:, 1:], actor_obs[:, None]), dim=1)
         with torch.no_grad():
             if self.training and self.num_steps < self.learning_starts:
                 actions = torch.rand(actor_obs.shape[0], self.actor.action_dim, device=self.device) * 2 - 1
             else:
-                actions = self.actor(actor_obs, goal if self.actor.goal_dim else None)
+                actions = self.actor(self._obs_history, goal if self.actor.goal_dim else None)
+                if self.training and self.action_noise:
+                    actions = (actions + self.action_noise * torch.randn_like(actions)).clamp(-1.0, 1.0)
         self._transition = {
             "state": state.detach(),
             "observation": actor_obs.detach(),
@@ -83,6 +98,7 @@ class SuperMimic:
             "goal": goal.detach(),
             "reference_bin_id": bin_ids.detach(),
             "action": actions.detach(),
+            "a_prev": self._previous_actions.detach(),
         }
         return actions
 
@@ -94,7 +110,9 @@ class SuperMimic:
             raise RuntimeError("SuperMimic.process_env_step() called before act().")
         next_observations = obs
         dones = dones.to(self.device).bool().reshape(-1)
-        final_observations = extras.get("final_observation", extras.get("final_obs", extras.get("terminal_observation")))
+        final_observations = extras.get(
+            "final_observation", extras.get("final_obs", extras.get("terminal_observation"))
+        )
         if final_observations is not None:
             if not isinstance(final_observations, TensorDict):
                 raise TypeError("final_observation must be a TensorDict")
@@ -105,32 +123,27 @@ class SuperMimic:
         next_state = self._extract(next_observations, "state")
         next_actor_obs = self._extract(next_observations, "actor")
         next_clean = self._extract(next_observations, "clean_observation")
+        reset_actor_obs = self._extract(obs, "actor")
         rewards = rewards.to(self.device, dtype=torch.float32).reshape(-1)
-        self._episode_returns += rewards
+        self._episode_returns += self._episode_discount * rewards
+        self._episode_discount *= self.gamma
         current = self._transition
-        for env_id in range(dones.numel()):
-            transition = {
-                "state": current["state"][env_id],
-                "next_state": next_state[env_id],
-                "observation": current["observation"][env_id],
-                "next_observation": next_actor_obs[env_id],
-                "action": current["action"][env_id],
-                "reward": rewards[env_id],
-                "clean_observation": current["clean_observation"][env_id],
-                "next_clean_observation": next_clean[env_id],
-                "terminated": terminated[env_id],
-                "context": current["context"][env_id],
-                "goal": current["goal"][env_id],
-                "reference_bin_id": current["reference_bin_id"][env_id],
-            }
-            self.replay_buffer.add_step(env_id, transition)
-            if bool(dones[env_id]):
-                if not bool(terminated[env_id]):
-                    self.replay_buffer.end_episode(env_id)
-                self.sampler.update_returns(
-                    current["reference_bin_id"][env_id : env_id + 1], self._episode_returns[env_id : env_id + 1]
-                )
-                self._episode_returns[env_id] = 0.0
+        self.replay_buffer.add({
+            **current,
+            "next_state": next_state,
+            "next_observation": next_actor_obs,
+            "next_clean_observation": next_clean,
+            "reward": rewards,
+            "terminated": terminated,
+            "done": dones,
+        })
+        if dones.any():
+            self.sampler.update_returns(current["reference_bin_id"][dones], self._episode_returns[dones])
+            self._episode_returns[dones] = 0.0
+            self._episode_discount[dones] = 1.0
+            self._obs_history[dones] = reset_actor_obs[dones, None].expand(-1, self.actor.history_length, -1)
+            self._previous_actions[dones] = 0
+        self._previous_actions[~dones] = current["action"][~dones]
         self.num_steps += dones.numel()
         self._transition = None
 
@@ -138,9 +151,9 @@ class SuperMimic:
         metrics = {}
         for _ in range(self.gradient_steps):
             try:
-                batch = self.replay_buffer.sample()
+                batch = self.replay_buffer.sample_windows()
             except RuntimeError as error:
-                if "completed episode" in str(error):
+                if "needs" in str(error):
                     return metrics or {"model_loss": 0.0, "actor_loss": 0.0, "critic_loss": 0.0}
                 raise
             batch = self._batch_to_device(batch)
@@ -171,16 +184,18 @@ class SuperMimic:
         for parameter in self.critic.parameters():
             parameter.requires_grad_(False)
 
-        state = batch.states[:, 0]
-        policy_obs = batch.clean_observations[:, 0]
-        context, goal = batch.contexts[:, 0], batch.goals[:, 0]
+        starts, history = self.replay_buffer.sample_starts()
+        state = starts["state"]
+        policy_history = history["clean_observation"]
+        policy_obs = policy_history[:, -1]
+        context, goal = starts["context"], starts["goal"]
         survival = torch.ones(state.shape[0], 1, device=self.device)
         observations, rewards, terminals = [], [], []
         actor_return = torch.zeros_like(survival)
         discount = 1.0
         for _ in range(self.horizon):
             observations.append(policy_obs)
-            action = self.actor(policy_obs, goal if self.actor.goal_dim else None)
+            action = self.actor(policy_history, goal if self.actor.goal_dim else None)
             prediction = self.model.predict(state, action, context, goal)
             reward = prediction["reward"]
             terminal = prediction["termination_logit"].sigmoid()
@@ -190,6 +205,7 @@ class SuperMimic:
             terminals.append(terminal)
             state = prediction["next_state"]
             policy_obs = prediction["clean_observation"]
+            policy_history = torch.cat((policy_history[:, 1:], policy_obs[:, None]), dim=1)
             discount *= self.gamma
         actor_return = actor_return + discount * survival * self.critic(
             torch.cat((policy_obs, goal), dim=-1) if self.actor.goal_dim else policy_obs
@@ -201,18 +217,19 @@ class SuperMimic:
         self.actor_optimizer.step()
 
         with torch.no_grad():
-            values = torch.stack(
-                [self.critic(torch.cat((item, goal), dim=-1) if self.actor.goal_dim else item) for item in observations]
-            )
+            values = torch.stack([
+                self.critic(torch.cat((item, goal), dim=-1) if self.actor.goal_dim else item) for item in observations
+            ])
             last_value = self.critic(torch.cat((policy_obs, goal), dim=-1) if self.actor.goal_dim else policy_obs)
             advantages, returns = self.compute_gae(
                 torch.stack(rewards), values, last_value, torch.stack(terminals), self.gamma, self.gae_lambda
             )
         for parameter in self.critic.parameters():
             parameter.requires_grad_(True)
-        critic_values = torch.stack(
-            [self.critic(torch.cat((item.detach(), goal), dim=-1) if self.actor.goal_dim else item.detach()) for item in observations]
-        )
+        critic_values = torch.stack([
+            self.critic(torch.cat((item.detach(), goal), dim=-1) if self.actor.goal_dim else item.detach())
+            for item in observations
+        ])
         critic_loss = F.mse_loss(critic_values, returns)
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
@@ -285,8 +302,8 @@ class SuperMimic:
                 getattr(self, f"{name}_optimizer").load_state_dict(loaded_dict[f"{name}_optimizer_state_dict"])
         if load_cfg.get("replay_buffer", True):
             self.replay_buffer.load_state_dict(loaded_dict["replay_buffer_state_dict"])
-            for env_id in tuple(self.replay_buffer._current):
-                self.replay_buffer.end_episode(env_id)
+            # The simulator will start fresh episodes after checkpoint load.
+            self.replay_buffer.episode_steps.zero_()
             self.sampler.load_state_dict(loaded_dict["sampler_state_dict"])
         self.num_updates = int(loaded_dict.get("num_updates", 0))
         self.num_steps = int(loaded_dict.get("num_steps", 0))
@@ -306,37 +323,72 @@ class SuperMimic:
         groups.setdefault("goal", [])
         resolved = {key: value for key, value in groups.items() if key in {"actor", "critic"}}
         groups.update(resolve_obs_groups(obs, resolved, ["actor", "critic"]))
-        dims = {key: sum(obs[group].shape[-1] for group in groups[key]) for key in ("actor", "state", "clean_observation", "context", "goal")}
+        dims = {
+            key: sum(obs[group].shape[-1] for group in groups[key])
+            for key in ("actor", "state", "clean_observation", "context", "goal")
+        }
         if dims["actor"] != dims["clean_observation"]:
             raise ValueError("SuperMimic clean_observation must have the same dimension as the actor observation")
-        if "reference_bin_id" not in obs:
-            raise ValueError("SuperMimic observations must include reference_bin_id from the task reset protocol")
         task = getattr(env, "unwrapped", env)
         dataset = getattr(task, "_supermimic_reference_dataset", None)
         if dataset is None:
             raise ValueError("SuperMimic task must expose _supermimic_reference_dataset before algorithm construction")
-        sampler = ReturnAwareReferenceSampler(dataset, len(dataset.reference_bins))
+        gamma = float(algorithm_cfg.get("gamma", 0.99))
+        sampler = ReturnAwareReferenceSampler(
+            dataset, len(dataset.reference_bins), max_return=1.0 / max(1e-6, 1.0 - gamma)
+        )
+        memory = cfg.get("memory", {})
         model = SuperMimicWorldModel(
-            dims["state"], env.num_actions, dims["clean_observation"], dims["context"], dims["goal"],
+            dims["state"],
+            env.num_actions,
+            dims["clean_observation"],
+            dims["context"],
+            dims["goal"],
             tuple(cfg.get("model", {}).get("hidden_dims", (256, 256, 256))),
         )
         actor = SuperMimicActor(
-            dims["actor"], env.num_actions, dims["goal"], tuple(cfg.get("actor", {}).get("hidden_dims", (256, 256)))
+            dims["actor"],
+            env.num_actions,
+            dims["goal"],
+            int(memory.get("history_length", 10)),
+            tuple(cfg.get("actor", {}).get("hidden_dims", (256, 256))),
         )
         critic = SuperMimicCritic(
             dims["clean_observation"] + dims["goal"], tuple(cfg.get("critic", {}).get("hidden_dims", (256, 256)))
         )
         algorithm_cfg.pop("rnd_cfg", None)
-        memory = cfg.get("memory", {})
         batch_size = int(memory.get("batch_size", 256))
         sequence_length = int(memory.get("sequence_length", algorithm_cfg.get("model_sequence_length", 8)))
         algorithm_cfg.pop("model_sequence_length", None)
-        replay = SuperMimicReplayBuffer(memory.get("capacity", 1_000_000), sequence_length, batch_size, device)
+        history_length = int(memory.get("history_length", 10))
+        replay = SuperMimicReplayBuffer(
+            memory.get("capacity", 1_000_000), env.num_envs, sequence_length, batch_size, history_length, device
+        )
         return cls(
-            model, actor, critic, replay, sampler, groups, batch_size, device,
-            **{key: value for key, value in algorithm_cfg.items() if key in {
-                "horizon", "gamma", "gae_lambda", "learning_starts", "gradient_steps", "train_every", "lr", "grad_clip_norm"
-            }},
+            model,
+            actor,
+            critic,
+            replay,
+            sampler,
+            groups,
+            batch_size,
+            device,
+            **{
+                key: value
+                for key, value in algorithm_cfg.items()
+                if key
+                in {
+                    "horizon",
+                    "gamma",
+                    "gae_lambda",
+                    "learning_starts",
+                    "gradient_steps",
+                    "train_every",
+                    "lr",
+                    "grad_clip_norm",
+                    "action_noise",
+                }
+            },
         )
 
     def _extract(self, obs: TensorDict, group: str) -> torch.Tensor:
@@ -345,13 +397,14 @@ class SuperMimic:
             return torch.zeros(obs.batch_size[0], 0, device=self.device)
         return torch.cat([obs[name].to(self.device, dtype=torch.float32) for name in groups], dim=-1)
 
-    @staticmethod
-    def _require_bin_ids(obs: TensorDict) -> None:
+    def _require_bin_ids(self, obs: TensorDict) -> None:
         if "reference_bin_id" not in obs:
             raise ValueError("SuperMimic task observations must include reference_bin_id")
         bins = obs["reference_bin_id"]
-        if bins.ndim not in (1, 2):
+        if bins.ndim not in (1, 2) or bins.numel() != obs.batch_size[0]:
             raise ValueError("reference_bin_id must contain one scalar per environment")
+        if (bins < 0).any() or (bins >= self.sampler.num_bins).any():
+            raise ValueError(f"reference_bin_id values must be in the range [0, {self.sampler.num_bins})")
 
     @staticmethod
     def _batch_to_device(batch: SuperMimicSequenceBatch) -> SuperMimicSequenceBatch:
@@ -362,11 +415,20 @@ class _SuperMimicPolicy(nn.Module):
     def __init__(self, algorithm: SuperMimic) -> None:
         super().__init__()
         self.algorithm = algorithm
+        self._history: torch.Tensor | None = None
 
     def forward(self, obs: TensorDict) -> torch.Tensor:
         actor_obs = self.algorithm._extract(obs, "actor")
         goal = self.algorithm._extract(obs, "goal")
-        return self.algorithm.actor(actor_obs, goal if self.algorithm.actor.goal_dim else None)
+        if self._history is None or self._history.shape[0] != actor_obs.shape[0]:
+            self._history = actor_obs[:, None].expand(-1, self.algorithm.actor.history_length, -1).clone()
+        else:
+            self._history = torch.cat((self._history[:, 1:], actor_obs[:, None]), dim=1)
+        return self.algorithm.actor(self._history, goal if self.algorithm.actor.goal_dim else None)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
-        return None
+        if self._history is None or dones is None:
+            self._history = None
+            return
+        dones = dones.to(self._history.device).bool().reshape(-1)
+        self._history[dones] = self._history[dones, -1:, :].expand(-1, self._history.shape[1], -1)

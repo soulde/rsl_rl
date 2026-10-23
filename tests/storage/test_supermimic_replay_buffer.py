@@ -3,68 +3,70 @@ import torch
 from rsl_rl.storage.supermimic_replay_buffer import SuperMimicReplayBuffer
 
 
-def _transition(index: int, *, terminated: bool = False) -> dict[str, torch.Tensor]:
-    value = float(index)
+def _transition(step: int, done: tuple[bool, ...] = (False,)) -> dict[str, torch.Tensor]:
+    count = len(done)
+    values = torch.arange(count, dtype=torch.float32) * 100 + step
     return {
-        "state": torch.tensor([value, value + 1]),
-        "next_state": torch.tensor([value + 1, value + 2]),
-        "observation": torch.tensor([value]),
-        "next_observation": torch.tensor([value + 1]),
-        "action": torch.tensor([value / 10]),
-        "reward": torch.tensor(value),
-        "clean_observation": torch.tensor([value + 2]),
-        "next_clean_observation": torch.tensor([value + 3]),
-        "terminated": torch.tensor(terminated),
-        "context": torch.tensor([0.25]),
-        "goal": torch.tensor([0.5]),
-        "reference_bin_id": torch.tensor(2),
+        "state": values[:, None],
+        "next_state": (values + 1)[:, None],
+        "observation": values[:, None],
+        "next_observation": (values + 1)[:, None],
+        "action": (values / 10)[:, None],
+        "a_prev": (values / 20)[:, None],
+        "reward": values,
+        "clean_observation": values[:, None],
+        "next_clean_observation": (values + 1)[:, None],
+        "terminated": torch.tensor(done),
+        "done": torch.tensor(done),
+        "context": torch.zeros(count, 1),
+        "goal": torch.zeros(count, 1),
+        "reference_bin_id": torch.zeros(count, dtype=torch.long),
     }
 
 
-def test_samples_contiguous_windows_with_all_transition_fields() -> None:
-    replay = SuperMimicReplayBuffer(capacity=32, sequence_length=2, batch_size=8)
-    for index in range(4):
-        replay.add_step(0, _transition(index, terminated=index == 3))
+def test_time_major_ring_samples_window_with_mask_after_episode_boundary() -> None:
+    replay = SuperMimicReplayBuffer(capacity=4, num_envs=1, sequence_length=3, batch_size=2, history_length=2)
+    replay.add(_transition(0))
+    replay.add(_transition(1, done=(True,)))
+    replay.add(_transition(2))
 
-    batch = replay.sample()
+    batch = replay.sample_windows()
 
-    assert batch.states.shape == (8, 3, 2)
-    assert batch.observations.shape == (8, 3, 1)
-    assert batch.actions.shape == (8, 2, 1)
-    assert batch.clean_observations.shape == (8, 3, 1)
-    assert batch.contexts.shape == (8, 2, 1)
-    assert batch.goals.shape == (8, 2, 1)
-    assert batch.reference_bin_ids.shape == (8, 2)
-    assert torch.all(batch.states[:, 1:, 0] == batch.states[:, :-1, 0] + 1)
-    assert torch.allclose(batch.actions[:, 1:, 0] - batch.actions[:, :-1, 0], torch.full((8, 1), 0.1))
+    assert batch.states.shape == (2, 4, 1)
+    assert batch.actions.shape == (2, 3, 1)
+    assert batch.mask.shape == (2, 3)
+    assert torch.equal(batch.mask[0], torch.tensor([1.0, 1.0, 0.0]))
+    assert torch.equal(batch.mask[1], torch.tensor([1.0, 1.0, 0.0]))
 
 
-def test_episode_boundaries_are_not_crossed_and_timeout_can_close_without_terminal() -> None:
-    replay = SuperMimicReplayBuffer(capacity=32, sequence_length=2, batch_size=16)
-    for index in range(2):
-        replay.add_step(0, _transition(index))
-    replay.end_episode(0)
-    for index in range(10, 12):
-        replay.add_step(0, _transition(index))
-    replay.end_episode(0)
+def test_start_history_clamps_to_episode_start_and_ring_capacity() -> None:
+    replay = SuperMimicReplayBuffer(capacity=3, num_envs=1, sequence_length=2, batch_size=32, history_length=4)
+    replay.add(_transition(0))
+    replay.add(_transition(1))
 
-    batch = replay.sample()
+    starts, history = replay.sample_starts()
 
-    assert torch.all((batch.states[:, 0, 0] < 2) | (batch.states[:, 0, 0] >= 10))
-    assert torch.all(batch.states[:, 1:, 0] == batch.states[:, :-1, 0] + 1)
-    assert torch.all(batch.terminated == 0)
+    assert starts["state"].shape == (32, 1)
+    assert history["observation"].shape == (32, 4, 1)
+    assert torch.all(history["observation"][:, 0] == history["observation"][:, 1])
+    assert torch.all(history["observation"][:, 1] == history["observation"][:, 2])
+    assert torch.all(history["ep_step"][:, -1] <= 1)
+
+    replay.add(_transition(2))
+    replay.add(_transition(3))
+    assert replay.size == 3
+    assert replay.data["state"][replay._row(torch.tensor([0, 1, 2])), 0, 0].tolist() == [1.0, 2.0, 3.0]
 
 
-def test_capacity_and_checkpoint_round_trip_preserve_sampleable_episodes() -> None:
-    replay = SuperMimicReplayBuffer(capacity=4, sequence_length=2, batch_size=2)
-    for episode_id in range(3):
-        for step in range(2):
-            replay.add_step(episode_id, _transition(episode_id * 10 + step))
-        replay.end_episode(episode_id)
+def test_ring_checkpoint_round_trip_preserves_pointer_and_samples() -> None:
+    replay = SuperMimicReplayBuffer(capacity=4, num_envs=2, sequence_length=2, batch_size=3, history_length=3)
+    for step in range(5):
+        replay.add(_transition(step, done=(False, step == 2)))
     state = replay.state_dict()
-    restored = SuperMimicReplayBuffer(capacity=4, sequence_length=2, batch_size=2)
+    restored = SuperMimicReplayBuffer(capacity=4, num_envs=2, sequence_length=2, batch_size=3, history_length=3)
     restored.load_state_dict(state)
 
-    assert replay.size == restored.size == 4
-    assert restored.num_episodes == 2
-    assert restored.sample().states.shape == (2, 3, 2)
+    assert restored.size == replay.size == 4
+    assert restored.ptr == replay.ptr
+    assert torch.equal(restored.data["state"], replay.data["state"])
+    assert restored.sample_windows().states.shape == (3, 3, 1)

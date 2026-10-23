@@ -1,8 +1,7 @@
-"""Sequence replay for SuperMimic world-model training."""
+"""Fixed-size time-major ring replay for SuperMimic."""
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 
 import torch
@@ -10,7 +9,7 @@ import torch
 
 @dataclass(frozen=True)
 class SuperMimicSequenceBatch:
-    """Episode-local sequences of transitions and their aligned state targets."""
+    """Transition windows with a mask that excludes samples after episode ends."""
 
     states: torch.Tensor
     observations: torch.Tensor
@@ -21,127 +20,183 @@ class SuperMimicSequenceBatch:
     contexts: torch.Tensor
     goals: torch.Tensor
     reference_bin_ids: torch.Tensor
+    done: torch.Tensor
+    mask: torch.Tensor
 
 
 class SuperMimicReplayBuffer:
-    """Fixed-capacity replay that samples contiguous windows from closed episodes."""
+    """Time-major ring whose transitions are stored together across vector envs."""
 
     _FIELDS = (
-        "state", "next_state", "observation", "next_observation", "action", "reward",
-        "clean_observation", "next_clean_observation", "terminated", "context", "goal", "reference_bin_id",
+        "state",
+        "next_state",
+        "observation",
+        "next_observation",
+        "action",
+        "a_prev",
+        "reward",
+        "clean_observation",
+        "next_clean_observation",
+        "terminated",
+        "done",
+        "context",
+        "goal",
+        "reference_bin_id",
+        "ep_step",
     )
 
     def __init__(
         self,
         capacity: int,
+        num_envs: int,
         sequence_length: int,
         batch_size: int,
+        history_length: int = 10,
         device: str | torch.device = "cpu",
     ) -> None:
-        if capacity <= 0 or sequence_length <= 0 or batch_size <= 0:
-            raise ValueError("Replay capacity, sequence length, and batch size must be positive.")
-        self.capacity = int(capacity)
-        self.sequence_length = int(sequence_length)
-        self.batch_size = int(batch_size)
+        if min(capacity, num_envs, sequence_length, batch_size, history_length) <= 0:
+            raise ValueError(
+                "Replay capacity, environment count, sequence length, batch size, and history must be positive"
+            )
+        self.capacity, self.num_envs = int(capacity), int(num_envs)
+        self.sequence_length, self.batch_size = int(sequence_length), int(batch_size)
+        self.history_length = int(history_length)
         self.device = torch.device(device)
-        self._episodes: deque[list[dict[str, torch.Tensor]]] = deque()
-        self._current: dict[int, list[dict[str, torch.Tensor]]] = {}
-        self._field_shapes: dict[str, torch.Size] | None = None
+        self.data: dict[str, torch.Tensor] = {}
+        self.ptr = 0
+        self.size = 0
+        self.num_episodes = 0
+        self.episode_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
-    @property
-    def size(self) -> int:
-        return sum(map(len, self._episodes)) + sum(map(len, self._current.values()))
-
-    @property
-    def num_episodes(self) -> int:
-        return len(self._episodes)
-
-    def add_step(self, env_id: int, transition: dict[str, torch.Tensor]) -> None:
-        """Append one transition; `terminated=True` closes its episode."""
-        missing = set(self._FIELDS) - transition.keys()
+    def add(self, transition: dict[str, torch.Tensor]) -> None:
+        """Write one vectorized simulator step, with leading dimension `num_envs`."""
+        # Episode step is derived locally so callers cannot accidentally carry
+        # a stale counter across vectorized resets.
+        missing = (set(self._FIELDS) - {"ep_step"}) - transition.keys()
         if missing:
             raise ValueError(f"SuperMimic replay transition is missing fields: {sorted(missing)}")
         values = {
-            key: torch.as_tensor(transition[key], device=self.device).detach().clone()
+            key: torch.as_tensor(transition[key], device=self.device).detach()
             for key in self._FIELDS
+            if key != "ep_step"
         }
-        values["reward"] = values["reward"].to(dtype=torch.float32).reshape(1)
-        values["terminated"] = values["terminated"].to(dtype=torch.bool).reshape(1)
-        values["reference_bin_id"] = values["reference_bin_id"].to(dtype=torch.long).reshape(())
+        values["ep_step"] = self.episode_steps.clone().to(torch.int32)
+        for key, value in values.items():
+            if value.ndim == 0 or value.shape[0] != self.num_envs:
+                raise ValueError(f"Replay field {key!r} must have leading dimension {self.num_envs}")
+        for key in ("reward",):
+            values[key] = values[key].to(torch.float32).reshape(self.num_envs)
+        for key in ("terminated", "done"):
+            values[key] = values[key].to(torch.bool).reshape(self.num_envs)
+        values["reference_bin_id"] = values["reference_bin_id"].to(torch.long).reshape(self.num_envs)
         for key in self._FIELDS:
-            if key not in {"reward", "terminated", "reference_bin_id"} and not values[key].is_floating_point():
-                values[key] = values[key].to(dtype=torch.float32)
-        if self._field_shapes is None:
-            self._field_shapes = {key: value.shape for key, value in values.items()}
-        elif any(values[key].shape != self._field_shapes[key] for key in self._FIELDS):
-            raise ValueError("SuperMimic replay transition field shapes changed after the first transition.")
-        episode = self._current.setdefault(int(env_id), [])
-        episode.append(values)
-        if bool(values["terminated"].item()):
-            self.end_episode(int(env_id))
+            if key not in {"reward", "terminated", "done", "reference_bin_id", "ep_step"}:
+                values[key] = values[key].to(torch.float32)
+        if not self.data:
+            self.data = {
+                key: torch.empty((self.capacity, *value.shape), dtype=value.dtype, device=self.device)
+                for key, value in values.items()
+            }
+        for key, value in values.items():
+            if value.shape != self.data[key].shape[1:]:
+                raise ValueError(f"Replay field {key!r} changed shape after first insertion")
+            self.data[key][self.ptr].copy_(value)
+        dones = values["done"]
+        self.episode_steps.add_(1)
+        self.episode_steps[dones] = 0
+        self.num_episodes += int(dones.sum().item())
+        self.ptr = (self.ptr + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
-    def end_episode(self, env_id: int) -> None:
-        """Close an episode, including timeouts whose terminal flag is false."""
-        episode = self._current.pop(int(env_id), [])
-        if episode:
-            self._episodes.append(episode)
-            self._enforce_capacity()
-
-    def sample(self) -> SuperMimicSequenceBatch:
-        eligible = [episode for episode in self._episodes if len(episode) >= self.sequence_length]
-        if not eligible:
-            raise RuntimeError(f"No completed episode can supply {self.sequence_length} transitions.")
-        sequences = []
-        for _ in range(self.batch_size):
-            episode = eligible[int(torch.randint(len(eligible), ()).item())]
-            start = int(torch.randint(len(episode) - self.sequence_length + 1, ()).item())
-            sequences.append(episode[start : start + self.sequence_length])
-
-        stack = lambda field: torch.stack([torch.stack([step[field] for step in seq]) for seq in sequences])
-        states = torch.stack(
-            [torch.stack([seq[0]["state"]] + [step["next_state"] for step in seq]) for seq in sequences]
+    def sample_windows(self, batch_size: int | None = None) -> SuperMimicSequenceBatch:
+        """Sample fixed-length windows and mask transition suffixes after done flags."""
+        batch_size = self.batch_size if batch_size is None else int(batch_size)
+        if self.size < self.sequence_length:
+            raise RuntimeError(f"Replay has {self.size} steps; needs {self.sequence_length} for a window")
+        start = torch.randint(self.size - self.sequence_length + 1, (batch_size,), device=self.device)
+        env_ids = torch.randint(self.num_envs, (batch_size,), device=self.device)
+        ages = start[:, None] + torch.arange(self.sequence_length, device=self.device)
+        rows = self._row(ages)
+        envs = env_ids[:, None].expand_as(rows)
+        out = {key: self.data[key][rows, envs] for key in self._FIELDS}
+        mask = torch.cumprod(
+            torch.cat((torch.ones(batch_size, 1, device=self.device), 1.0 - out["done"][:, :-1].float()), dim=1), dim=1
         )
-        observations = torch.stack(
-            [torch.stack([seq[0]["observation"]] + [step["next_observation"] for step in seq]) for seq in sequences]
-        )
-        clean_observations = torch.stack(
-            [torch.stack([seq[0]["clean_observation"]] + [step["next_clean_observation"] for step in seq]) for seq in sequences]
-        )
+        states = torch.cat((out["state"][:, :1], out["next_state"]), dim=1)
+        observations = torch.cat((out["observation"][:, :1], out["next_observation"]), dim=1)
+        clean_observations = torch.cat((out["clean_observation"][:, :1], out["next_clean_observation"]), dim=1)
         return SuperMimicSequenceBatch(
             states=states,
             observations=observations,
-            actions=stack("action"),
-            rewards=stack("reward"),
+            actions=out["action"],
+            rewards=out["reward"].unsqueeze(-1),
             clean_observations=clean_observations,
-            terminated=stack("terminated"),
-            contexts=stack("context"),
-            goals=stack("goal"),
-            reference_bin_ids=stack("reference_bin_id").squeeze(-1) if stack("reference_bin_id").ndim == 3 else stack("reference_bin_id"),
+            terminated=out["terminated"].unsqueeze(-1),
+            contexts=out["context"],
+            goals=out["goal"],
+            reference_bin_ids=out["reference_bin_id"],
+            done=out["done"].unsqueeze(-1),
+            mask=mask,
         )
 
+    def sample_starts(
+        self, batch_size: int | None = None, history_length: int | None = None
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Sample arbitrary starts and histories that do not cross episode starts."""
+        batch_size = self.batch_size if batch_size is None else int(batch_size)
+        history_length = self.history_length if history_length is None else int(history_length)
+        if self.size <= 0:
+            raise RuntimeError("Cannot sample starts from an empty replay")
+        ages = torch.randint(self.size, (batch_size,), device=self.device)
+        env_ids = torch.randint(self.num_envs, (batch_size,), device=self.device)
+        rows = self._row(ages)
+        starts = {
+            key: self.data[key][rows, env_ids]
+            for key in (
+                "state",
+                "observation",
+                "clean_observation",
+                "context",
+                "goal",
+                "a_prev",
+                "reference_bin_id",
+                "ep_step",
+            )
+        }
+        step_in_episode = starts["ep_step"].long()
+        offsets = torch.arange(history_length - 1, -1, -1, device=self.device)
+        back = torch.minimum(offsets[None, :], step_in_episode[:, None])
+        back = torch.minimum(back, ages[:, None])
+        history_rows = self._row(ages[:, None] - back)
+        history_envs = env_ids[:, None].expand_as(history_rows)
+        history = {
+            key: self.data[key][history_rows, history_envs]
+            for key in ("observation", "clean_observation", "a_prev", "context", "goal", "reference_bin_id", "ep_step")
+        }
+        return starts, history
+
     def state_dict(self) -> dict:
-        clone = lambda episodes: [[{key: value.clone() for key, value in step.items()} for step in ep] for ep in episodes]
         return {
             "capacity": self.capacity,
+            "num_envs": self.num_envs,
             "sequence_length": self.sequence_length,
             "batch_size": self.batch_size,
-            "episodes": clone(self._episodes),
-            "current": {env_id: clone([episode])[0] for env_id, episode in self._current.items()},
-            "field_shapes": self._field_shapes,
+            "history_length": self.history_length,
+            "ptr": self.ptr,
+            "size": self.size,
+            "num_episodes": self.num_episodes,
+            "episode_steps": self.episode_steps.clone(),
+            "data": {key: value.clone() for key, value in self.data.items()},
         }
 
     def load_state_dict(self, state_dict: dict) -> None:
-        if int(state_dict["sequence_length"]) != self.sequence_length:
-            raise ValueError("Replay checkpoint sequence_length does not match configuration.")
-        move = lambda episodes: [[{key: value.to(self.device) for key, value in step.items()} for step in ep] for ep in episodes]
-        self._episodes = deque(move(state_dict["episodes"]))
-        self._current = {int(env_id): move([episode])[0] for env_id, episode in state_dict["current"].items()}
-        self._field_shapes = state_dict.get("field_shapes")
-        self._enforce_capacity()
+        for key in ("capacity", "num_envs", "sequence_length", "history_length"):
+            if int(state_dict[key]) != getattr(self, key):
+                raise ValueError(f"Replay checkpoint {key} does not match configuration")
+        self.ptr, self.size = int(state_dict["ptr"]), int(state_dict["size"])
+        self.num_episodes = int(state_dict["num_episodes"])
+        self.episode_steps = state_dict["episode_steps"].to(self.device)
+        self.data = {key: value.to(self.device) for key, value in state_dict["data"].items()}
 
-    def _enforce_capacity(self) -> None:
-        while self.size > self.capacity and len(self._episodes) > 1:
-            self._episodes.popleft()
-        if self.size > self.capacity and self._episodes:
-            episode = self._episodes[0]
-            del episode[: len(episode) - self.capacity]
+    def _row(self, age: torch.Tensor) -> torch.Tensor:
+        return (self.ptr - self.size + age) % self.capacity
