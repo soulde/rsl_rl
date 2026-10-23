@@ -34,7 +34,7 @@ class ReturnAwareReferenceSampler:
         if hasattr(dataset, "reference_bins") and len(dataset.reference_bins) != self.num_bins:
             raise ValueError("num_bins must match the dataset's reference_bins count")
         self.return_estimates = torch.zeros(self.num_bins, device=self.device)
-        self.historical_weights = torch.full((self.num_bins,), 1.0 / self.num_bins, device=self.device)
+        self.historical_weights = torch.zeros(self.num_bins, device=self.device)
         self._probabilities = self._build_probabilities()
 
     @property
@@ -93,5 +93,8 @@ class ReturnAwareReferenceSampler:
     def _build_probabilities(self, soft: torch.Tensor | None = None) -> torch.Tensor:
         uniform = torch.full((self.num_bins,), 1.0 / self.num_bins, device=self.device)
         soft = self._soft_weights() if soft is None else soft
-        historical = self.historical_weights / self.historical_weights.sum().clamp_min(torch.finfo(torch.float32).eps)
+        historical_sum = self.historical_weights.sum()
+        historical = (
+            self.historical_weights / historical_sum if historical_sum > torch.finfo(torch.float32).eps else uniform
+        )
         return self.uniform_fraction * uniform + self.low_return_fraction * soft + self.historical_fraction * historical

@@ -50,9 +50,9 @@ def test_sampler_matches_reference_return_and_historical_ema() -> None:
     expected_returns = torch.tensor([2.0, 4.0, 0.0, 0.0])
     torch.testing.assert_close(sampler.return_estimates, expected_returns)
     soft = torch.softmax(-25.0 * expected_returns / 100.0, dim=0)
-    initial_history = torch.full((4,), 0.25)
+    initial_history = torch.zeros(4)
     sampler.sample_reference_states(torch.arange(8))
 
     torch.testing.assert_close(sampler.historical_weights, 0.999 * initial_history + 0.001 * soft)
-    expected = 0.5 * initial_history + 0.4 * soft + 0.1 * sampler.historical_weights / sampler.historical_weights.sum()
+    expected = 0.5 * torch.full((4,), 0.25) + 0.5 * soft
     torch.testing.assert_close(sampler.probabilities, expected)
