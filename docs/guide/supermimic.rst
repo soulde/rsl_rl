@@ -6,22 +6,23 @@ world model. It uses sequence replay for supervised next-state, reward, clean
 observation, and termination prediction, then optimizes the actor and value
 critic on imagined trajectories. Configure it with ``OffPolicyRunner``.
 
-The algorithm requires an Isaac Lab task with reference-state initialization.
-Before constructing the runner, the unwrapped task must expose a motion dataset
-as ``_supermimic_reference_dataset``. It must provide
-``sample_reference_states_by_bin(bin_ids)`` and ``reference_bins``. The runner
-injects ``_supermimic_rsi_sampler``, ``_supermimic_rsi_joint_layout``, and
-``_supermimic_num_reference_bins`` into that task, then calls ``env.reset()``
-after injection.
+The algorithm requires an environment whose unwrapped task exposes its analytic
+MDP as ``_supermimic_mdp`` and implements the public
+``set_reference_state_sampler(sampler, joint_layout)`` method. The runner only
+calls the algorithm's optional ``initialize_env(env)`` lifecycle hook; the
+SuperMimic algorithm uses that hook to pass its sampler through the task API and
+reset the environment before collection. The generic runner does not inspect
+SuperMimic or RSI fields.
 
-At reset, the task calls:
+The task's motion command stores the sampler and joint layout locally. At reset,
+it calls:
 
 .. code-block:: python
 
-   states, bin_ids = self._supermimic_rsi_sampler(env_ids)
+   states, bin_ids = self._reference_state_sampler(env_ids)
 
 It applies the returned root and joint
-state using ``_supermimic_rsi_joint_layout``, records the bin IDs, and exposes
+state using the supplied ``joint_layout``, records the bin IDs, and exposes
 them in a top-level scalar-per-environment observation named
 ``reference_bin_id``. Keep this field in every observation until the next
 reset; the trainer uses it to associate episode returns with reset bins.
@@ -29,13 +30,6 @@ SuperMimic requires this contract and raises an error if the field is missing.
 The sampled state dictionary also includes ``reference_motion_ids`` and
 ``reference_frame_ids``. Tasks using reference goals can expose them in each
 observation as ``reference_motion_id`` and ``reference_frame_id``.
-
-For imagined rollouts with time-varying reference goals, define
-``task._supermimic_goal_provider(motion_ids, frame_ids, count)`` before creating
-the runner. It must return goals with shape ``[count, batch, goal_dim]``;
-``count`` is ``horizon + 1`` so the critic also receives the final goal.
-Without this optional hook, the trainer holds the sampled goal constant over
-the imagined rollout.
 
 .. code-block:: python
 
@@ -45,8 +39,13 @@ the imagined rollout.
            "horizon": 32,
            "gamma": 0.99,
            "gae_lambda": 0.95,
-           "learning_starts": 2048,
-           "gradient_steps": 1,
+           "warmup_steps": 64,
+           "utd": 0.4,
+           "wm_only_iters": 500,
+           "wm_batches": 10,
+           "policy_batch_size": 4096,
+           "critic_epochs": 5,
+           "critic_minibatches": 4,
        },
        "model": {"hidden_dims": [256, 256, 256]},
        "actor": {"hidden_dims": [256, 256]},
@@ -65,7 +64,6 @@ the imagined rollout.
            "goal": ["reference_goal"],
            "critic": ["clean_policy"],
        },
-       "num_steps_per_env": 32,
    }
 
 The ``actor`` and ``clean_observation`` groups must have the same dimension.

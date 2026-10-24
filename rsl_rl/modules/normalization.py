@@ -83,6 +83,38 @@ class EmpiricalNormalization(nn.Module):
         return y * (self._std + self.eps) + self._mean
 
 
+class RunningNorm(nn.Module):
+    """Running mean/std normalizer with mergeable batch statistics and a sample-count limit."""
+
+    def __init__(self, dim: int, max_count: float = 200000000.0, eps: float = 0.01):
+        super().__init__()
+        self.register_buffer("mean", torch.zeros(dim))
+        self.register_buffer("var", torch.ones(dim))
+        self.register_buffer("count", torch.zeros(()))
+        self.max_count, self.eps = max_count, eps
+
+    @torch.no_grad()
+    def update(self, x: torch.Tensor) -> None:
+        x = x.reshape(-1, x.shape[-1]).float()
+        if self.count >= self.max_count:
+            return
+        n = x.shape[0]
+        if n == 0:
+            return
+        mean, var = x.mean(0), x.var(0, unbiased=False)
+        total = self.count + n
+        delta = mean - self.mean
+        self.mean += delta * n / total
+        self.var = (self.var * self.count + var * n + delta**2 * self.count * n / total) / total
+        self.count = total
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
+
+    def std(self) -> torch.Tensor:
+        return torch.sqrt(self.var + self.eps**2)
+
+
 class EmpiricalDiscountedVariationNormalization(nn.Module):
     """Reward normalization from Pathak's large scale study on PPO.
 

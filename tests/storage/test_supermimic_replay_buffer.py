@@ -21,6 +21,8 @@ def _transition(step: int, done: tuple[bool, ...] = (False,)) -> dict[str, torch
         "context": torch.zeros(count, 1),
         "goal": torch.zeros(count, 1),
         "reference_bin_id": torch.zeros(count, dtype=torch.long),
+        "reference_motion_id": torch.zeros(count, dtype=torch.long),
+        "reference_frame_id": torch.full((count,),step,dtype=torch.long),
     }
 
 
@@ -44,12 +46,13 @@ def test_start_history_clamps_to_episode_start_and_ring_capacity() -> None:
     replay.add(_transition(0))
     replay.add(_transition(1))
 
-    starts, history = replay.sample_starts()
+    batch = replay.sample_starts()
+    starts, history = batch.start, batch.history
 
     assert starts["state"].shape == (32, 1)
-    assert history["observation"].shape == (32, 4, 1)
-    assert torch.all(history["observation"][:, 0] == history["observation"][:, 1])
-    assert torch.all(history["observation"][:, 1] == history["observation"][:, 2])
+    assert history["state"].shape == (32, 4, 1)
+    assert torch.all(history["state"][:, 0] == history["state"][:, 1])
+    assert torch.all(history["state"][:, 1] == history["state"][:, 2])
     assert torch.all(history["ep_step"][:, -1] <= 1)
 
     replay.add(_transition(2))

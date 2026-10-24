@@ -1,222 +1,157 @@
 import copy
-
 import pytest
 import torch
-from tensordict import TensorDict
-
 from rsl_rl.algorithms import SuperMimic
-from rsl_rl.env import VecEnv
+from tests.supermimic_helpers import make_mdp, make_env, observation, config
 
 
-class _Dataset:
-    device = "cpu"
-    reference_bins = [[(0, 0)], [(0, 1)]]
-
-    def sample_reference_states_by_bin(self, bin_ids):
-        return {"sampled_bin_ids": bin_ids.clone()}
+def algorithm(tmp_path):
+    mdp = make_mdp(tmp_path)
+    return SuperMimic.construct_algorithm(observation(mdp), make_env(mdp), config(), "cpu")
 
 
-class _Env(VecEnv):
-    num_envs = 2
-    num_actions = 2
-    device = "cpu"
-    max_episode_length = 8
-    episode_length_buf = torch.zeros(2, dtype=torch.long)
-    cfg = {}
-
-    def __init__(self):
-        self.unwrapped = self
-        self._supermimic_reference_dataset = _Dataset()
-
-    def get_observations(self):
-        return _obs()
-
-    def step(self, actions):
-        return _obs(), torch.ones(2), torch.zeros(2, dtype=torch.bool), {}
+def collect(alg, count=4):
+    for step in range(count):
+        obs = observation(alg.mdp, step)
+        alg.act(obs)
+        alg.process_env_step(observation(alg.mdp, step + 1), torch.ones(2) * 0.09, torch.zeros(2, dtype=torch.bool), {})
 
 
-def _obs():
-    return TensorDict(
-        {
-            "policy": torch.randn(2, 4),
-            "state": torch.randn(2, 5),
-            "clean": torch.randn(2, 4),
-            "reference_bin_id": torch.tensor([0, 1]),
-        },
-        batch_size=[2],
-    )
+def test_collect_update_analytic_actor_gradients_and_normalizers(tmp_path):
+    alg = algorithm(tmp_path)
+    collect(alg)
+    before = [p.clone() for p in alg.actor.parameters()]
+    metrics = alg.update(0)
+    assert {"model_loss", "actor_loss", "critic_loss"} <= metrics.keys()
+    assert all(torch.isfinite(torch.tensor(v)) for v in metrics.values())
+    assert any(not torch.equal(a, b) for a, b in zip(before, alg.actor.parameters()))
+    assert alg.model.in_norm.count == 8 and alg.actor.obs_norm.count == 8
+    assert all(p.requires_grad for p in alg.model.parameters())
+    assert set(alg.replay_buffer.data) == set(alg.replay_buffer._FIELDS)
 
 
-def _cfg():
-    return {
-        "algorithm": {"class_name": "SuperMimic", "horizon": 3, "learning_starts": 0, "gradient_steps": 1},
-        "model": {"hidden_dims": [16, 16]},
-        "actor": {"hidden_dims": [16, 16]},
-        "critic": {"hidden_dims": [16, 16]},
-        "memory": {"capacity": 64, "sequence_length": 2, "batch_size": 4},
-        "obs_groups": {
-            "actor": ["policy"],
-            "state": ["state"],
-            "clean_observation": ["clean"],
-            "critic": ["policy"],
-        },
-    }
-
-
-def test_construct_collects_transitions_and_requires_reference_bin_ids() -> None:
-    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
-    actions = algorithm.act(_obs())
-    algorithm.process_env_step(
-        _obs(),
-        torch.ones(2),
-        torch.tensor([False, True]),
-        {"time_outs": torch.tensor([False, True]), "reference_bin_id": torch.tensor([0, 1])},
-    )
-
-    assert actions.shape == (2, 2)
-    assert algorithm.replay_buffer.size == 1
-    assert algorithm.replay_buffer.num_episodes == 1
-    with pytest.raises(ValueError, match="reference_bin_id"):
-        algorithm.act(
-            TensorDict(
-                {"policy": torch.zeros(2, 4), "state": torch.zeros(2, 5), "clean": torch.zeros(2, 4)}, batch_size=[2]
-            )
-        )
-
-
-def test_construct_rejects_policy_and_clean_observation_dimension_mismatch() -> None:
-    cfg = _cfg()
-    cfg["obs_groups"]["clean_observation"] = ["state"]
-
-    with pytest.raises(ValueError, match="clean_observation"):
-        SuperMimic.construct_algorithm(_obs(), _Env(), cfg, "cpu")
-
-
-def test_autoreset_keeps_terminal_transition_and_reset_history_separate() -> None:
-    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
-    current = _obs()
-    algorithm.act(current)
-    reset_obs = _obs()
-    final_obs = _obs()
-    final_obs["policy"] = torch.full_like(final_obs["policy"], 99.0)
-    final_obs["clean"] = torch.full_like(final_obs["clean"], 99.0)
-
-    algorithm.process_env_step(
-        reset_obs,
-        torch.ones(2),
+def test_terminal_mapping_preserves_final_state_and_timeout_bootstrap(tmp_path):
+    alg = algorithm(tmp_path)
+    alg.act(observation(alg.mdp))
+    reset = observation(alg.mdp, 0)
+    final = observation(alg.mdp, 1)
+    final["state"][0, 0] = 3.0
+    alg.process_env_step(
+        reset,
+        torch.tensor([0.1, 0.1]),
         torch.tensor([True, False]),
-        {"final_observation": final_obs, "time_outs": torch.tensor([False, False])},
+        {"final_obs": dict(final.items()), "time_outs": torch.tensor([True, False])},
     )
-
-    torch.testing.assert_close(algorithm.replay_buffer.data["next_observation"][0, 0], final_obs["policy"][0])
-    torch.testing.assert_close(algorithm._obs_history[0], reset_obs["policy"][0].expand(10, -1))
-
-
-def test_imagined_rollout_queries_task_goal_for_each_reference_frame() -> None:
-    cfg = _cfg()
-    cfg["obs_groups"]["goal"] = ["goal_features"]
-    initial_obs = _obs()
-    initial_obs["goal_features"] = torch.zeros(2, 1)
-    algorithm = SuperMimic.construct_algorithm(initial_obs, _Env(), cfg, "cpu")
-    calls = []
-
-    def provide_goals(motion_ids, frame_ids, count):
-        calls.append((motion_ids.clone(), frame_ids.clone(), count))
-        return torch.arange(count, dtype=torch.float32)[..., None, None].expand(count, motion_ids.numel(), 1)
-
-    algorithm.set_goal_provider(provide_goals)
-    for step in range(3):
-        obs = _obs()
-        obs["goal_features"] = torch.zeros(2, 1)
-        obs["reference_motion_id"] = torch.tensor([4, 7])
-        obs["reference_frame_id"] = torch.tensor([step, step + 10])
-        algorithm.act(obs)
-        algorithm.process_env_step(obs, torch.ones(2), torch.zeros(2, dtype=torch.bool), {})
-
-    metrics = algorithm.update()
-
-    assert calls and calls[0][2] == algorithm.horizon + 1
-    assert set(metrics) >= {"actor_loss", "critic_loss"}
-    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert alg.replay_buffer.data["next_state"][0, 0, 0] == 3
+    assert alg.dataset.reference_state_sampler.max_return == pytest.approx(10.0)
+    assert alg.dataset.reference_state_sampler.return_estimates[0] == pytest.approx(2.0)
+    assert not hasattr(alg, "sampler")
+    alg.act(reset)
+    with pytest.raises(RuntimeError, match="pre-reset"):
+        alg.process_env_step(reset, torch.zeros(2), torch.ones(2, dtype=torch.bool), {})
 
 
-def test_construct_allows_pre_reset_observation_but_act_requires_reset_bin_id() -> None:
-    observation = TensorDict(
-        {"policy": torch.zeros(2, 4), "state": torch.zeros(2, 5), "clean": torch.zeros(2, 4)},
-        batch_size=[2],
-    )
-    algorithm = SuperMimic.construct_algorithm(observation, _Env(), _cfg(), "cpu")
-
-    with pytest.raises(ValueError, match="reference_bin_id"):
-        algorithm.act(observation)
-
-
-def test_act_rejects_out_of_range_reference_bin_id() -> None:
-    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
-    observation = _obs()
-    observation["reference_bin_id"][0] = 2
-
-    with pytest.raises(ValueError, match="reference_bin_id.*range"):
-        algorithm.act(observation)
+def test_reference_schedule_model_only_stage_and_lr_decay(tmp_path):
+    alg = algorithm(tmp_path)
+    assert [alg.collection_steps(i) for i in range(4)] == [2, 3, 2, 3]
+    collect(alg)
+    alg.wm_only_iters = 500
+    before = [p.clone() for p in alg.actor.parameters()]
+    assert "actor_loss" not in alg.update(1)
+    assert all(torch.equal(a, b) for a, b in zip(before, alg.actor.parameters()))
+    alg.update(alg.lr_decay_iters)
+    assert alg.learning_rate == pytest.approx(alg.initial_lr * 0.03)
 
 
-def test_update_trains_model_actor_and_critic_with_finite_losses() -> None:
-    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
-    for _ in range(3):
-        obs = _obs()
-        algorithm.act(obs)
-        algorithm.process_env_step(
-            obs, torch.ones(2), torch.zeros(2, dtype=torch.bool), {"reference_bin_id": obs["reference_bin_id"]}
-        )
-    metrics = algorithm.update()
+def test_algorithm_binds_rsi_through_public_task_api_before_reset(tmp_path):
+    alg = algorithm(tmp_path)
 
-    assert set(metrics) >= {"model_loss", "actor_loss", "critic_loss"}
-    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
-    assert algorithm.num_updates == 1
+    class Task:
+        def set_reference_state_sampler(self, sampler, layout):
+            self.sampler, self.layout = sampler, layout
 
+    class Env:
+        def __init__(self):
+            self.unwrapped = Task()
+            self.reset_called = False
 
-def test_imagined_actor_update_backpropagates_through_frozen_world_model() -> None:
-    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
-    for step in range(3):
-        obs = _obs()
-        algorithm.act(obs)
-        algorithm.process_env_step(
-            obs,
-            torch.ones(2),
-            torch.full((2,), step == 2),
-            {"reference_bin_id": obs["reference_bin_id"]},
-        )
-    batch = algorithm.replay_buffer.sample_windows()
-    model_before = [parameter.detach().clone() for parameter in algorithm.model.parameters()]
+        def reset(self):
+            assert callable(self.unwrapped.sampler)
+            assert self.unwrapped.layout["joint_names"] == tuple(alg.mdp.dataset.joint_names)
+            self.reset_called = True
 
-    algorithm._update_imagined_policy(batch)
+    env = Env()
+    alg.initialize_env(env)
 
-    assert any(
-        parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in algorithm.actor.parameters()
-    )
-    assert all(torch.equal(before, after) for before, after in zip(model_before, algorithm.model.parameters()))
-    assert all(parameter.requires_grad for parameter in algorithm.model.parameters())
+    assert env.unwrapped.sampler.__self__ is alg
+    assert env.reset_called
 
 
-def test_gae_uses_terminal_masks_and_bootstrap_value() -> None:
+def test_checkpoint_version_and_restore(tmp_path):
+    alg = algorithm(tmp_path)
+    collect(alg)
+    alg.update()
+    state = copy.deepcopy(alg.save())
+    new = algorithm(tmp_path)
+    new.load(state)
+    assert new.num_updates == alg.num_updates and new.num_steps == alg.num_steps
+    assert torch.equal(new.actor.obs_norm.mean, alg.actor.obs_norm.mean)
+    with pytest.raises(ValueError, match="Incompatible"):
+        new.load({"actor_state_dict": {}})
+
+
+def test_imagination_rejects_clip_tail_starts(tmp_path):
+    alg = algorithm(tmp_path)
+    collect(alg)
+    alg.replay_buffer.data["reference_frame_id"].fill_(79)
+    with pytest.raises(RuntimeError, match="valid reference"):
+        alg._sample_valid_starts()
+
+
+def test_lambda_returns_and_soft_termination():
     rewards = torch.tensor([[1.0], [2.0]])
     values = torch.tensor([[0.5], [0.25]])
-    next_value = torch.tensor([0.75])
-    terminated = torch.tensor([[False], [True]])
-
-    advantages, returns = SuperMimic.compute_gae(rewards, values, next_value, terminated, gamma=0.9, gae_lambda=0.95)
-
-    assert advantages.shape == returns.shape == (2, 1)
-    torch.testing.assert_close(advantages[-1], torch.tensor([1.75]))
+    advantages, returns = SuperMimic.compute_gae(
+        rewards, values, torch.tensor([0.75]), torch.tensor([[0.0], [1.0]]), 0.9, 0.95
+    )
+    torch.testing.assert_close(returns[-1], torch.tensor([2.0]))
     torch.testing.assert_close(returns, advantages + values)
 
 
-def test_save_load_restores_replay_sampler_and_optimizers() -> None:
-    algorithm = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
-    state = algorithm.save()
-    restored = SuperMimic.construct_algorithm(_obs(), _Env(), _cfg(), "cpu")
+def test_collection_policy_has_reference_action_clipping(tmp_path):
+    alg = algorithm(tmp_path)
+    alg.action_noise = 0
+    with torch.no_grad():
+        alg.actor.network[-1].bias.fill_(30)
+    action = alg.act(observation(alg.mdp))
+    torch.testing.assert_close(action, torch.full_like(action, 20.0))
 
-    restored.load(copy.deepcopy(state))
 
-    assert restored.num_updates == algorithm.num_updates
-    assert torch.equal(restored.sampler.probabilities, algorithm.sampler.probabilities)
+def test_replay_resume_closes_old_session_boundary(tmp_path):
+    alg = algorithm(tmp_path)
+    alg.save_replay = True
+    collect(alg)
+    state = copy.deepcopy(alg.save())
+    new = algorithm(tmp_path)
+    new.load(state)
+    row = (new.replay_buffer.ptr - 1) % new.replay_buffer.capacity
+    assert new.replay_buffer.data["done"][row].all()
+    assert not new.replay_buffer.episode_steps.any()
+    collect(new, 1)
+    batch = new.replay_buffer.sample_windows(128)
+    # Any sampled old-session suffix after the marked row must be masked.
+    assert (batch.mask[:, 1:] <= (1 - batch.done[:, :-1].float())).all()
+
+
+def test_inference_history_reset_uses_next_reset_observation(tmp_path):
+    alg = algorithm(tmp_path)
+    policy = alg.get_policy()
+    first = observation(alg.mdp)
+    first["policy"].fill_(1.0)
+    policy(first)
+    policy.reset(torch.tensor([True, False]))
+    fresh = observation(alg.mdp)
+    fresh["policy"].fill_(7.0)
+    policy(fresh)
+    torch.testing.assert_close(policy._history[0], torch.full_like(policy._history[0], 7.0))
+    torch.testing.assert_close(policy._history[1, :-1], torch.ones_like(policy._history[1, :-1]))

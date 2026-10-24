@@ -137,9 +137,12 @@ Actions are normalized to ``[-1, 1]``. For auto-reset environments, include a
 ``final_observation`` TensorDict in ``extras`` when a done transition's returned
 observation has already been reset; the algorithms use it for replay targets.
 
-Replay settings are provided in ``memory`` (``capacity`` and ``batch_size``), with
-collection cadence configured by ``num_steps_per_env`` and ``algorithm.train_every``.
-Use ``algorithm.learning_starts`` to collect warm-up experience before updates.
+Replay settings are provided in ``memory`` (``capacity`` and ``batch_size``).
+Off-policy algorithms share ``algorithm.utd`` (learner updates per vectorized
+environment step) and ``algorithm.warmup_steps`` (vectorized environment steps
+collected before updates). FastSAC and TD-MPC2 accept the legacy
+``learning_starts``, ``train_every`` and ``gradient_steps`` options and convert
+them to the shared schedule when ``utd`` or ``warmup_steps`` are omitted.
 FastSAC's ``actor`` and ``critic`` sections configure their networks, while TD-MPC2's
 ``model`` section configures the latent world model and its ``algorithm`` section
 configures the planner and model updates.

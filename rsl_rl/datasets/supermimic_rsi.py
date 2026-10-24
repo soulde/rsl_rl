@@ -1,76 +1,83 @@
-"""Return-aware reference-state initialization for SuperMimic tasks."""
+"""Return-aware reference-state sampler owned by a motion dataset."""
 
 from __future__ import annotations
 
 import torch
 
+from .reference_sampler import ReferenceStateBatch, ReferenceStateSampler
 
-class ReturnAwareReferenceSampler:
-    """Sample one-second reference bins using uniform and return-aware weights."""
+
+class ReturnAwareReferenceSampler(ReferenceStateSampler):
+    """Mix uniform-bin, low-return, and historical sampling for SuperMimic."""
 
     def __init__(
         self,
-        dataset,
         num_bins: int,
         uniform_fraction: float = 0.5,
         low_return_fraction: float = 0.4,
         historical_fraction: float = 0.1,
         temperature: float = 25.0,
         max_return: float = 1.0,
+        device="cpu",
     ) -> None:
         fractions = torch.tensor([uniform_fraction, low_return_fraction, historical_fraction], dtype=torch.float32)
         if num_bins <= 0 or (fractions < 0).any() or not torch.isclose(fractions.sum(), torch.tensor(1.0)):
             raise ValueError("Sampler requires positive num_bins and mixture fractions summing to one.")
         if temperature < 0 or max_return <= 0:
             raise ValueError("temperature must be nonnegative and max_return positive")
-        self.dataset = dataset
         self.num_bins = int(num_bins)
         self.uniform_fraction = float(uniform_fraction)
         self.low_return_fraction = float(low_return_fraction)
         self.historical_fraction = float(historical_fraction)
         self.temperature = float(temperature)
         self.max_return = float(max_return)
-        self.device = torch.device(getattr(dataset, "device", "cpu"))
-        if hasattr(dataset, "reference_bins") and len(dataset.reference_bins) != self.num_bins:
-            raise ValueError("num_bins must match the dataset's reference_bins count")
+        self.device = torch.device(device)
         self.return_estimates = torch.zeros(self.num_bins, device=self.device)
-        self.historical_weights = torch.zeros(self.num_bins, device=self.device)
+        self.historical_weights = torch.full((self.num_bins,), 1.0 / self.num_bins, device=self.device)
         self._probabilities = self._build_probabilities()
 
     @property
     def probabilities(self) -> torch.Tensor:
         return self._probabilities.clone()
 
-    def sample_reference_states(self, env_ids: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-        env_ids = torch.as_tensor(env_ids, device=self.device)
-        if env_ids.ndim != 1:
-            raise ValueError("RSI env_ids must be one-dimensional")
+    def sample(self, dataset, batch_size: int) -> ReferenceStateBatch:
+        if batch_size < 0:
+            raise ValueError("batch_size must be non-negative")
+        reference_bins = getattr(dataset, "reference_bins", None)
+        if reference_bins is None or len(reference_bins) != self.num_bins:
+            raise ValueError("Return-aware sampler bin count must match the dataset reference_bins")
         soft = self._soft_weights()
         self.historical_weights.mul_(0.999).add_(soft, alpha=0.001)
         self._probabilities = self._build_probabilities(soft)
-        bin_ids = torch.multinomial(self._probabilities, int(env_ids.numel()), replacement=True)
-        states = self._sample_states(bin_ids)
-        return states, bin_ids
+        bin_ids = torch.multinomial(self._probabilities, batch_size, replacement=True)
+        states = self._sample_states(dataset, bin_ids)
+        return ReferenceStateBatch(states, bin_ids)
 
-    def _sample_states(self, bin_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Sample states and retain their source frame when the dataset exposes bins."""
-        # The base dataset API intentionally returns just state tensors. RSI
-        # needs the selected clip/frame as well so the task can keep tracking
-        # the same motion after applying the sampled reset state.
-        reference_bins = getattr(self.dataset, "reference_bins", None)
-        decode = getattr(self.dataset, "_decode_reference_states", None)
-        if reference_bins is None or decode is None:
-            return self.dataset.sample_reference_states_by_bin(bin_ids)
+    def _sample_states(self, dataset, bin_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Sample a frame within each selected bin, retaining clip/frame IDs."""
+        reference_bins = dataset.reference_bins
+        decode = getattr(dataset, "_decode_reference_states", None)
+        if decode is None:
+            states = dataset.sample_reference_states_by_bin(bin_ids)
+            return states
 
         selected_frames = []
         for bin_id in bin_ids.cpu().tolist():
             frames = reference_bins[bin_id]
+            motions = getattr(dataset, "motions", None)
+            if motions is not None:
+                usable = [
+                    (motion_id, frame_id)
+                    for motion_id, frame_id in frames
+                    if frame_id < len(motions[motion_id]["joint_pos"]) - 1
+                ]
+                frames = usable or frames
             if not frames:
                 raise RuntimeError(f"RSI reference bin {bin_id} contains no frames")
             frame_index = int(torch.randint(len(frames), ()).item())
             selected_frames.append(frames[frame_index])
         states = decode(selected_frames)
-        with_joint_contract = getattr(self.dataset, "_with_joint_contract", None)
+        with_joint_contract = getattr(dataset, "_with_joint_contract", None)
         if with_joint_contract is not None:
             states = with_joint_contract(states)
         states["reference_motion_ids"] = torch.tensor(

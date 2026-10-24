@@ -43,10 +43,10 @@ def valid_amp_transition_mask(dones: torch.Tensor) -> torch.Tensor:
 def resolve_motion_dataset_class(algorithm_cfg: dict):
     """Resolve the configured AMP expert-motion dataset implementation."""
     dataset_format = algorithm_cfg.get("motion_dataset_format", "beyondmimic")
-    from rsl_rl.datasets import MotionDataset, SomaMotionDataset, VariableDofMotionDataset
+    from rsl_rl.datasets import BeyondMimicMotionDataset, SomaMotionDataset, VariableDofMotionDataset
 
     dataset_classes = {
-        "beyondmimic": MotionDataset,
+        "beyondmimic": BeyondMimicMotionDataset,
         "soma": SomaMotionDataset,
         "variable_dof": VariableDofMotionDataset,
     }
@@ -60,9 +60,11 @@ def _resolve_rsi_frame_sampler(
     expert_dataset: Any, rsi_dataset: Any | None = None
 ) -> Callable[[int], dict[str, torch.Tensor]]:
     """Keep RSI sampling independent when a dedicated initialization dataset is configured."""
-    if rsi_dataset is not None:
-        return rsi_dataset.sample_reference_states
-    return expert_dataset.sample_reference_states
+    dataset = rsi_dataset if rsi_dataset is not None else expert_dataset
+    if callable(getattr(dataset, "sample_reference_state_batch", None)):
+        return lambda batch_size: dataset.sample_reference_state_batch(batch_size).states
+    # Keep support for small custom/legacy dataset adapters implementing the old API.
+    return dataset.sample_reference_states
 
 
 class AmpReplayBuffer:

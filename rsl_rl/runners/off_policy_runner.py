@@ -7,9 +7,9 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
-
 import torch
 
 from rsl_rl.env import VecEnv
@@ -28,26 +28,9 @@ class OffPolicyRunner:
         obs = self.env.get_observations()
         algorithm_class = resolve_callable(self.cfg["algorithm"]["class_name"])
         self.alg = algorithm_class.construct_algorithm(obs, self.env, self.cfg, self.device)
-        if getattr(self.alg, "requires_reference_state_initialization", False):
-            task = getattr(self.env, "unwrapped", None)
-            reset = getattr(self.env, "reset", None)
-            sample_rsi = getattr(self.alg, "sample_rsi", None)
-            get_layout = getattr(self.alg, "get_rsi_joint_layout", None)
-            if task is None or not callable(reset):
-                raise RuntimeError(
-                    "SuperMimic requires an Isaac Lab task exposing env.unwrapped and reset() for reference-state initialization"
-                )
-            if not callable(sample_rsi) or not callable(get_layout):
-                raise RuntimeError(
-                    "Reference-state initialization requires sample_rsi() and get_rsi_joint_layout() APIs"
-                )
-            task._supermimic_rsi_sampler = sample_rsi
-            task._supermimic_rsi_joint_layout = get_layout()
-            task._supermimic_num_reference_bins = int(self.alg.sampler.num_bins)
-            set_goal_provider = getattr(self.alg, "set_goal_provider", None)
-            if callable(set_goal_provider):
-                set_goal_provider(getattr(task, "_supermimic_goal_provider", None))
-            reset()
+        initialize_env = getattr(self.alg, "initialize_env", None)
+        if callable(initialize_env):
+            initialize_env(self.env)
         self.logger = Logger(
             log_dir=log_dir,
             cfg=self.cfg,
@@ -62,27 +45,24 @@ class OffPolicyRunner:
         self.total_steps = 0
 
     def learn(self, num_learning_iterations: int) -> None:
-        """Collect `num_steps_per_env` vectorized steps per learning iteration."""
+        """Run the shared warmup and UTD schedule for off-policy algorithms."""
         if num_learning_iterations < 0:
             raise ValueError("num_learning_iterations cannot be negative.")
-        num_steps_per_env = int(self.cfg["num_steps_per_env"])
-        if num_steps_per_env <= 0:
-            raise ValueError("num_steps_per_env must be positive.")
-        learning_starts = int(self.cfg["algorithm"].get("learning_starts", getattr(self.alg, "learning_starts", 0)))
-        train_every = int(self.cfg["algorithm"].get("train_every", getattr(self.alg, "train_every", 1)))
-        if learning_starts < 0 or train_every <= 0:
-            raise ValueError("learning_starts cannot be negative and train_every must be positive.")
+        if num_learning_iterations == 0:
+            return
+        utd = float(self.alg.utd)
+        warmup_steps = int(self.alg.warmup_steps)
+        if not math.isfinite(utd) or utd <= 0 or warmup_steps < 0:
+            raise ValueError("Algorithm utd must be finite and positive and warmup_steps cannot be negative.")
 
         obs = self.env.get_observations().to(self.device)
         self.alg.train_mode()
         self.logger.init_logging_writer()
-        start_iteration = self.current_learning_iteration
-        total_iterations = start_iteration + num_learning_iterations
-        for iteration in range(start_iteration, total_iterations):
-            start_time = time.time()
-            loss_sums: dict[str, float] = {}
-            update_count = 0
-            for _ in range(num_steps_per_env):
+        self.logger.cfg = dict(self.cfg)
+
+        def collect(count):
+            nonlocal obs
+            for _ in range(count):
                 actions = self.alg.act(obs)
                 next_obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                 next_obs = next_obs.to(self.device)
@@ -91,34 +71,41 @@ class OffPolicyRunner:
                 self.alg.process_env_step(next_obs, rewards, dones, extras)
                 self.logger.process_env_step(rewards, dones, extras)
                 self.total_steps += self.env.num_envs
-                env_step = self.total_steps // self.env.num_envs
-                if self.total_steps >= learning_starts and env_step % train_every == 0:
-                    losses = self.alg.update()
-                    for key, value in losses.items():
-                        loss_sums[key] = loss_sums.get(key, 0.0) + float(value)
-                    update_count += 1
                 obs = next_obs
 
-            elapsed = time.time() - start_time
-            losses = {key: value / max(update_count, 1) for key, value in loss_sums.items()}
-            self.current_learning_iteration = iteration
+        warmup_collected = int(self.alg.warmup_steps_collected)
+        if warmup_collected < warmup_steps:
+            collect(warmup_steps - warmup_collected)
+        start = self.current_learning_iteration
+        end = start + num_learning_iterations
+        for iteration in range(start, end):
+            begin = time.time()
+            collection_steps = math.floor((iteration + 1) / utd) - math.floor(iteration / utd)
+            collect(collection_steps)
+            collect_time = time.time() - begin
+            update_begin = time.time()
+            losses = self.alg.update()
+            learn_time = time.time() - update_begin
+            self.logger.cfg["num_steps_per_env"] = collection_steps
+            self.logger.tot_timesteps = self.total_steps - collection_steps * self.env.num_envs
+            self.current_learning_iteration = iteration + 1
             self.logger.log(
                 it=iteration,
-                start_it=start_iteration,
-                total_it=total_iterations,
-                collect_time=elapsed,
-                learn_time=0.0,
+                start_it=start,
+                total_it=end,
+                collect_time=collect_time,
+                learn_time=learn_time,
                 loss_dict=losses,
                 learning_rate=float(getattr(self.alg, "learning_rate", 0.0)),
                 action_std=torch.zeros(1, device=self.device),
                 rnd_weight=None,
             )
-            save_interval = int(self.cfg.get("save_interval", 0))
-            if self.logger.writer is not None and save_interval > 0 and iteration % save_interval == 0:
-                self.save(os.path.join(self.logger.log_dir, f"model_{iteration}.pt"))  # type: ignore[arg-type]
-
+            interval = int(self.cfg.get("save_interval", 0))
+            checkpoint_iteration = iteration + 1
+            if self.logger.writer is not None and interval > 0 and checkpoint_iteration % interval == 0:
+                self.save(os.path.join(self.logger.log_dir, f"model_{checkpoint_iteration}.pt"))
         if self.logger.writer is not None:
-            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore[arg-type]
+            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))
             self.logger.stop_logging_writer()
 
     def save(self, path: str, infos: dict | None = None) -> None:
@@ -144,3 +131,26 @@ class OffPolicyRunner:
         """Return the algorithm's deterministic policy in evaluation mode."""
         self.alg.eval_mode()
         return self.alg.get_policy().to(device or self.device)
+
+    def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
+        """Export the algorithm policy using its deployment interface."""
+        model = self.alg.get_policy().as_jit().cpu().eval()
+        os.makedirs(path, exist_ok=True)
+        torch.jit.script(model).save(os.path.join(path, filename))
+
+    def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
+        """Export an explicit-history policy with a dynamic batch dimension."""
+        model = self.alg.get_policy().as_onnx(verbose=verbose).cpu().eval()
+        os.makedirs(path, exist_ok=True)
+        torch.onnx.export(
+            model,
+            model.get_dummy_inputs(),
+            os.path.join(path, filename),
+            export_params=True,
+            opset_version=18,
+            verbose=verbose,
+            input_names=model.input_names,
+            output_names=model.output_names,
+            dynamic_axes={name: {0: "batch"} for name in model.input_names + model.output_names},
+            dynamo=False,
+        )

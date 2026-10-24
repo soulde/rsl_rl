@@ -34,8 +34,8 @@ class TDMPC2:
         episode_length: int,
         device: str = "cpu",
         horizon: int = 3,
-        learning_starts: int = 0,
-        gradient_steps: int = 1,
+        learning_starts: int | None = None,
+        gradient_steps: int | None = None,
         reward_coef: float = 0.1,
         value_coef: float = 0.1,
         termination_coef: float = 1.0,
@@ -58,13 +58,28 @@ class TDMPC2:
         temperature: float = 0.5,
         entropy_coef: float = 1e-4,
         episodic: bool = False,
-        train_every: int = 1,
+        train_every: int | None = None,
+        utd: float | None = None,
+        warmup_steps: int | None = None,
+        num_envs: int = 1,
     ) -> None:
-        if horizon <= 0 or batch_size <= 0 or gradient_steps <= 0 or train_every <= 0:
-            raise ValueError("TD-MPC2 horizon, batch size, gradient steps, and train_every must be positive.")
+        legacy_learning_starts = 0 if learning_starts is None and warmup_steps is None else learning_starts
+        legacy_gradient_steps = 1 if gradient_steps is None else gradient_steps
+        legacy_train_every = 1 if train_every is None else train_every
+        if horizon <= 0 or batch_size <= 0 or num_envs <= 0:
+            raise ValueError("TD-MPC2 horizon, batch size, and num_envs must be positive.")
+        if legacy_gradient_steps <= 0 or legacy_train_every <= 0:
+            raise ValueError("TD-MPC2 legacy update intervals must be positive.")
+        utd = legacy_gradient_steps / legacy_train_every if utd is None else float(utd)
+        if not python_math.isfinite(utd) or utd <= 0:
+            raise ValueError("TD-MPC2 utd must be finite and positive.")
+        if warmup_steps is None:
+            warmup_steps = python_math.ceil((legacy_learning_starts or 0) / num_envs)
+        if warmup_steps < 0:
+            raise ValueError("TD-MPC2 warmup_steps cannot be negative.")
         if episode_length <= 0:
             raise ValueError("TD-MPC2 requires a positive vector environment episode length.")
-        if learning_starts < 0:
+        if legacy_learning_starts is not None and legacy_learning_starts < 0:
             raise ValueError("TD-MPC2 learning_starts cannot be negative.")
         if iterations <= 0 or num_samples <= 0 or not 1 <= num_elites <= num_samples:
             raise ValueError("TD-MPC2 planner iterations and sample counts must be positive, with num_elites <= num_samples.")
@@ -77,8 +92,10 @@ class TDMPC2:
         self.batch_size = batch_size
         self.episode_length = int(episode_length)
         self.horizon = horizon
-        self.learning_starts = learning_starts
-        self.gradient_steps = gradient_steps
+        self.num_envs = int(num_envs)
+        self.utd = float(utd)
+        self.warmup_steps = int(warmup_steps)
+        self.learning_starts = self.warmup_steps * self.num_envs
         self.reward_coef = reward_coef
         self.value_coef = value_coef
         self.termination_coef = termination_coef
@@ -97,7 +114,6 @@ class TDMPC2:
         self.max_std = max_std
         self.temperature = temperature
         self.entropy_coef = entropy_coef
-        self.train_every = train_every
         self.discount = min(max(1.0 - discount_denom / self.episode_length, discount_min), discount_max)
         self._scale = torch.ones((), device=self.device)
         trainable_model_parameters = [
@@ -141,6 +157,11 @@ class TDMPC2:
         self._episode_start.zero_()
         return actions
 
+    @property
+    def warmup_steps_collected(self) -> int:
+        """Return replayed vector steps available toward the configured warmup."""
+        return min(self.replay_buffer.size // self.num_envs, self.warmup_steps)
+
     def process_env_step(
         self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
     ) -> None:
@@ -177,18 +198,15 @@ class TDMPC2:
         self._transition_observations = None
         self._transition_actions = None
 
-    def update(self) -> dict[str, float]:
+    def update(self, iteration: int | None = None) -> dict[str, float]:
         """Update the world model and policy from sampled episode sequences."""
-        metrics: dict[str, float] = {}
-        for _ in range(self.gradient_steps):
-            try:
-                batch = self.replay_buffer.sample()
-            except RuntimeError as error:
-                if "long enough" in str(error):
-                    return metrics or {"total_loss": 0.0, "pi_loss": 0.0}
-                raise
-            metrics = self._update_batch(batch.observations, batch.actions, batch.rewards, batch.terminated)
-        return metrics
+        try:
+            batch = self.replay_buffer.sample()
+        except RuntimeError as error:
+            if "long enough" in str(error):
+                return {"total_loss": 0.0, "pi_loss": 0.0}
+            raise
+        return self._update_batch(batch.observations, batch.actions, batch.rewards, batch.terminated)
 
     def _update_batch(
         self, observations: torch.Tensor, actions: torch.Tensor, rewards: torch.Tensor, terminated: torch.Tensor
@@ -388,6 +406,7 @@ class TDMPC2:
             batch_size=batch_size,
             episode_length=episode_length,
             device=device,
+            num_envs=env.num_envs,
             **algorithm_options,
         )
 

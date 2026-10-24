@@ -41,13 +41,30 @@ class FastSAC:
         init_alpha: float = 0.2,
         target_entropy_ratio: float = 1.0,
         auto_entropy: bool = True,
-        learning_starts: int = 5_000,
-        train_every: int = 1,
-        gradient_steps: int = 1,
+        learning_starts: int | None = None,
+        train_every: int | None = None,
+        gradient_steps: int | None = None,
         device: str = "cpu",
+        utd: float | None = None,
+        warmup_steps: int | None = None,
+        num_envs: int = 1,
     ) -> None:
-        if batch_size <= 0 or learning_starts < 0 or train_every <= 0 or gradient_steps <= 0:
-            raise ValueError("FastSAC batch size and update intervals must be positive; learning_starts cannot be negative.")
+        legacy_learning_starts = 5_000 if learning_starts is None and warmup_steps is None else learning_starts
+        legacy_train_every = 1 if train_every is None else train_every
+        legacy_gradient_steps = 1 if gradient_steps is None else gradient_steps
+        if batch_size <= 0 or num_envs <= 0:
+            raise ValueError("FastSAC batch_size and num_envs must be positive.")
+        if legacy_learning_starts is not None and legacy_learning_starts < 0:
+            raise ValueError("FastSAC learning_starts cannot be negative.")
+        if legacy_train_every <= 0 or legacy_gradient_steps <= 0:
+            raise ValueError("FastSAC legacy update intervals must be positive.")
+        utd = legacy_gradient_steps / legacy_train_every if utd is None else float(utd)
+        if not math.isfinite(utd) or utd <= 0:
+            raise ValueError("FastSAC utd must be finite and positive.")
+        if warmup_steps is None:
+            warmup_steps = math.ceil((legacy_learning_starts or 0) / num_envs)
+        if warmup_steps < 0:
+            raise ValueError("FastSAC warmup_steps cannot be negative.")
         if not 0.0 <= gamma <= 1.0 or not 0.0 < tau <= 1.0:
             raise ValueError("FastSAC requires gamma in [0, 1] and tau in (0, 1].")
         if init_alpha <= 0.0:
@@ -72,9 +89,10 @@ class FastSAC:
         self.batch_size = batch_size
         self.gamma = gamma
         self.tau = tau
-        self.learning_starts = learning_starts
-        self.train_every = train_every
-        self.gradient_steps = gradient_steps
+        self.num_envs = int(num_envs)
+        self.utd = float(utd)
+        self.warmup_steps = int(warmup_steps)
+        self.learning_starts = self.warmup_steps * self.num_envs
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.auto_entropy = auto_entropy
@@ -93,6 +111,11 @@ class FastSAC:
     def alpha(self) -> torch.Tensor:
         """Return the current entropy temperature."""
         return self.log_alpha.exp()
+
+    @property
+    def warmup_steps_collected(self) -> int:
+        """Return replayed vector steps available toward the configured warmup."""
+        return min(self.replay_buffer.size // self.num_envs, self.warmup_steps)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Choose actions and retain the current observations for replay insertion."""
@@ -136,66 +159,64 @@ class FastSAC:
         self._transition_actions = None
         self.num_steps += rewards.shape[0]
 
-    def update(self) -> dict[str, float]:
+    def update(self, iteration: int | None = None) -> dict[str, float]:
         """Perform configured critic, actor, temperature, and target updates."""
         if self.replay_buffer.size < self.batch_size:
             return {"actor_loss": 0.0, "critic_loss": 0.0, "alpha": float(self.alpha.detach())}
-        metric_sums = {"actor_loss": 0.0, "critic_loss": 0.0, "alpha_loss": 0.0}
-        for _ in range(self.gradient_steps):
-            batch = self.replay_buffer.sample(self.batch_size)
-            actor_obs = self._select_groups(batch.observations, self.obs_groups["actor"])
-            critic_obs = self._select_groups(batch.observations, self.obs_groups["critic"])
-            next_actor_obs = self._select_groups(batch.next_observations, self.obs_groups["actor"])
-            next_critic_obs = self._select_groups(batch.next_observations, self.obs_groups["critic"])
-            with torch.no_grad():
-                next_actions, next_log_prob = self.actor.sample(next_actor_obs)
-                target_logits = self.target_critic(next_critic_obs, next_actions)
-                target_values = self.target_critic.values(target_logits)
-                selected_q = target_values.argmin(dim=0)
-                q_indices = torch.arange(self.batch_size, device=self.device)
-                target_probabilities = target_logits.softmax(dim=-1)[selected_q, q_indices]
-                target_distribution = self.critic.project(
-                    target_probabilities,
-                    batch.rewards - self.gamma * (1.0 - batch.dones) * self.alpha.detach() * next_log_prob,
-                    1.0 - batch.dones,
-                    self.gamma,
-                )
+        batch = self.replay_buffer.sample(self.batch_size)
+        actor_obs = self._select_groups(batch.observations, self.obs_groups["actor"])
+        critic_obs = self._select_groups(batch.observations, self.obs_groups["critic"])
+        next_actor_obs = self._select_groups(batch.next_observations, self.obs_groups["actor"])
+        next_critic_obs = self._select_groups(batch.next_observations, self.obs_groups["critic"])
+        with torch.no_grad():
+            next_actions, next_log_prob = self.actor.sample(next_actor_obs)
+            target_logits = self.target_critic(next_critic_obs, next_actions)
+            target_values = self.target_critic.values(target_logits)
+            selected_q = target_values.argmin(dim=0)
+            q_indices = torch.arange(self.batch_size, device=self.device)
+            target_probabilities = target_logits.softmax(dim=-1)[selected_q, q_indices]
+            target_distribution = self.critic.project(
+                target_probabilities,
+                batch.rewards - self.gamma * (1.0 - batch.dones) * self.alpha.detach() * next_log_prob,
+                1.0 - batch.dones,
+                self.gamma,
+            )
 
-            logits = self.critic(critic_obs, batch.actions)
-            critic_loss = -(
-                target_distribution.unsqueeze(0) * F.log_softmax(logits, dim=-1)
-            ).sum(dim=-1).mean(dim=1).sum(dim=0)
-            self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss.backward()
-            self.critic_optimizer.step()
+        logits = self.critic(critic_obs, batch.actions)
+        critic_loss = -(
+            target_distribution.unsqueeze(0) * F.log_softmax(logits, dim=-1)
+        ).sum(dim=-1).mean(dim=1).sum(dim=0)
+        self.critic_optimizer.zero_grad(set_to_none=True)
+        critic_loss.backward()
+        self.critic_optimizer.step()
 
-            for parameter in self.critic.parameters():
-                parameter.requires_grad_(False)
-            actions, log_prob = self.actor.sample(actor_obs)
-            actor_values = self.critic.values(self.critic(critic_obs, actions)).min(dim=0).values
-            actor_loss = (self.alpha.detach() * log_prob - actor_values.unsqueeze(-1)).mean()
-            self.actor_optimizer.zero_grad(set_to_none=True)
-            actor_loss.backward()
-            self.actor_optimizer.step()
-            for parameter in self.critic.parameters():
-                parameter.requires_grad_(True)
+        for parameter in self.critic.parameters():
+            parameter.requires_grad_(False)
+        actions, log_prob = self.actor.sample(actor_obs)
+        actor_values = self.critic.values(self.critic(critic_obs, actions)).min(dim=0).values
+        actor_loss = (self.alpha.detach() * log_prob - actor_values.unsqueeze(-1)).mean()
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        self.actor_optimizer.step()
+        for parameter in self.critic.parameters():
+            parameter.requires_grad_(True)
 
-            alpha_loss = torch.zeros((), device=self.device)
-            if self.auto_entropy:
-                alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
-                self.alpha_optimizer.zero_grad(set_to_none=True)  # type: ignore[union-attr]
-                alpha_loss.backward()
-                self.alpha_optimizer.step()  # type: ignore[union-attr]
+        alpha_loss = torch.zeros((), device=self.device)
+        if self.auto_entropy:
+            alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+            self.alpha_optimizer.zero_grad(set_to_none=True)  # type: ignore[union-attr]
+            alpha_loss.backward()
+            self.alpha_optimizer.step()  # type: ignore[union-attr]
 
-            with torch.no_grad():
-                for target, source in zip(self.target_critic.parameters(), self.critic.parameters()):
-                    target.lerp_(source, self.tau)
-            metric_sums["actor_loss"] += float(actor_loss.detach())
-            metric_sums["critic_loss"] += float(critic_loss.detach())
-            metric_sums["alpha_loss"] += float(alpha_loss.detach())
-            self.num_updates += 1
-        return {key: value / self.gradient_steps for key, value in metric_sums.items()} | {
-            "alpha": float(self.alpha.detach())
+        with torch.no_grad():
+            for target, source in zip(self.target_critic.parameters(), self.critic.parameters()):
+                target.lerp_(source, self.tau)
+        self.num_updates += 1
+        return {
+            "actor_loss": float(actor_loss.detach()),
+            "critic_loss": float(critic_loss.detach()),
+            "alpha_loss": float(alpha_loss.detach()),
+            "alpha": float(self.alpha.detach()),
         }
 
     def train_mode(self) -> None:
@@ -296,6 +317,7 @@ class FastSAC:
             obs_group_dims=group_dims,
             batch_size=memory_cfg.get("batch_size", 256),
             device=device,
+            num_envs=env.num_envs,
             **alg_options,
         )
         return instance

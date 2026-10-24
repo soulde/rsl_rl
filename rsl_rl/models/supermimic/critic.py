@@ -1,21 +1,17 @@
-"""Value critic for imagined SuperMimic trajectories."""
+"""Privileged invariant-state critic for imagined tracking trajectories."""
 
-from __future__ import annotations
-
-import torch
 from torch import nn
-
-from .world_model import _mlp
+from rsl_rl.modules.mlp import MLP
+from rsl_rl.modules.normalization import RunningNorm
+from ..common import run_mlp
 
 
 class SuperMimicCritic(nn.Module):
-    """Estimate discounted value from policy observation and optional goal features."""
-
-    def __init__(self, input_dim: int, hidden_dims: tuple[int, ...] = (256, 256)) -> None:
+    def __init__(self, input_dim, hidden_dims=(256, 128), mixed_precision=True):
         super().__init__()
-        if input_dim <= 0:
-            raise ValueError("Critic input_dim must be positive")
-        self.network = _mlp(input_dim, hidden_dims, 1)
+        self.mixed_precision = mixed_precision
+        self.norm = RunningNorm(input_dim)
+        self.network = MLP(input_dim, 1, hidden_dims, activation="elu")
 
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        return self.network(observation)
+    def forward(self, features):
+        return run_mlp(self.network, self.norm(features), self.mixed_precision and self.training).squeeze(-1)

@@ -9,6 +9,8 @@ from .dagger_storage import BetaSchedule, DaggerStorage
 from .episode_replay_buffer import EpisodeReplayBuffer, EpisodeSequenceBatch
 from .off_policy_replay_buffer import OffPolicyBatch, OffPolicyReplayBuffer
 from .rollout_storage import RolloutStorage
+from .replay import ReplayBatch, ReplaySampler, TensorRingStorage
+from .replay_samplers import EpisodeSequenceSampler, SuperMimicReplaySampler, UniformTransitionSampler
 from .supermimic_replay_buffer import SuperMimicReplayBuffer, SuperMimicSequenceBatch
 
 __all__ = [
@@ -19,6 +21,12 @@ __all__ = [
     "OffPolicyBatch",
     "OffPolicyReplayBuffer",
     "RolloutStorage",
+    "ReplayBatch",
+    "ReplaySampler",
+    "TensorRingStorage",
+    "EpisodeSequenceSampler",
+    "SuperMimicReplaySampler",
+    "UniformTransitionSampler",
     "SuperMimicReplayBuffer",
     "SuperMimicSequenceBatch",
 ]

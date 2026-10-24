@@ -27,6 +27,9 @@ class _Algorithm:
         self.updates = 0
         self.training_mode = None
         self.policy = _Policy()
+        self.utd = 0.5
+        self.warmup_steps = 0
+        self.warmup_steps_collected = 0
 
     def act(self, obs):
         return torch.zeros(obs.batch_size[0], 1)
@@ -116,49 +119,31 @@ def test_runner_save_load_and_inference_policy(tmp_path, monkeypatch) -> None:
 
 
 class _ReferenceAlgorithm(_Algorithm):
-    requires_reference_state_initialization = True
-
     def __init__(self):
         super().__init__()
-        self.sampler = SimpleNamespace(num_bins=7)
+        self.initialized_env = None
 
-    def sample_rsi(self, env_ids):
-        return {"joint_pos": torch.zeros(env_ids.numel(), 1)}, torch.zeros_like(env_ids)
-
-    def get_rsi_joint_layout(self):
-        return {"joint_names": ("hip",)}
+    def initialize_env(self, env):
+        self.initialized_env = env
 
 
-class _ReferenceEnv(_Env):
-    def __init__(self):
-        super().__init__()
-        self.unwrapped = self
-        self.reset_called = False
-        self.reset_saw_sampler = False
-
-    def reset(self):
-        self.reset_called = True
-        self.reset_saw_sampler = callable(getattr(self, "_supermimic_rsi_sampler", None))
-
-
-def test_runner_injects_supermimic_sampler_before_initial_reset(monkeypatch) -> None:
+def test_runner_delegates_environment_initialization_to_algorithm(monkeypatch) -> None:
     from rsl_rl.runners import off_policy_runner
 
     monkeypatch.setattr(off_policy_runner, "resolve_callable", lambda name: _ReferenceAlgorithm)
-    runner = OffPolicyRunner(_ReferenceEnv(), _cfg(), log_dir=None, device="cpu")
+    runner = OffPolicyRunner(_Env(), _cfg(), log_dir=None, device="cpu")
 
-    assert callable(runner.env._supermimic_rsi_sampler)
-    assert runner.env._supermimic_rsi_joint_layout == {"joint_names": ("hip",)}
-    assert runner.env.reset_called and runner.env.reset_saw_sampler
+    assert runner.alg.initialized_env is runner.env
+    assert not hasattr(runner.env, "_supermimic_rsi_sampler")
 
 
-def test_runner_rejects_reference_sampler_algorithm_without_task_reset_protocol(monkeypatch) -> None:
+def test_runner_without_environment_hook_does_not_require_task_protocol(monkeypatch) -> None:
     from rsl_rl.runners import off_policy_runner
 
-    monkeypatch.setattr(off_policy_runner, "resolve_callable", lambda name: _ReferenceAlgorithm)
+    monkeypatch.setattr(off_policy_runner, "resolve_callable", lambda name: _Algorithm)
+    runner = OffPolicyRunner(_Env(), _cfg(), log_dir=None, device="cpu")
 
-    with pytest.raises(RuntimeError, match="unwrapped.*reset"):
-        OffPolicyRunner(_Env(), _cfg(), log_dir=None, device="cpu")
+    assert runner.alg is not None
 
 
 class _NativeEnv(_Env):
@@ -240,7 +225,7 @@ def test_native_algorithms_construct_train_checkpoint_and_infer(tmp_path) -> Non
         restored.load(str(checkpoint))
         policy = restored.get_inference_policy()
 
-        assert restored.total_steps == 2
-        assert restored.current_learning_iteration == 0
+        assert restored.total_steps == 102
+        assert restored.current_learning_iteration == 1
         inference_obs = TensorDict({"policy": torch.randn(2, obs_dim)}, batch_size=[2])
         assert policy(inference_obs).shape == (2, action_dim)

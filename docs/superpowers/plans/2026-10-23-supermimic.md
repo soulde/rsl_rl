@@ -41,7 +41,7 @@
 - Test: `tests/datasets/test_supermimic_rsi.py`
 
 **Interfaces:**
-- Produce `SuperMimicReplayBuffer(capacity, num_envs, sequence_length, batch_size, history_length, device)` with `add(transition_batch)`, `sample_windows() -> SuperMimicSequenceBatch`, `sample_starts() -> (start_batch, history_batch)`, `state_dict()`, and `load_state_dict(state_dict)`.
+- Produce `SuperMimicReplayBuffer(capacity, num_envs, sequence_length, batch_size, history_length, device)` with `add(transition_batch)`, `sample_windows() -> SuperMimicSequenceBatch`, and `sample_starts() -> ReplayBatch(start=..., history=...)`, plus `state_dict()` and `load_state_dict(state_dict)`.
 - The replay is a time-major ring `[capacity, num_envs, ...]`; batches carry `[B,T,...]` fields plus a mask that becomes zero after an episode boundary. Start sampling returns a history window that repeats the episode's first transition if less than `history_length` history is available.
 - Add `BaseMotionDataset.sample_reference_states_by_bin(bin_ids) -> dict[str, Tensor]`, where bins are one-second motion intervals and sampled frame offsets are uniform within each selected interval.
 - Produce `ReturnAwareReferenceSampler(dataset, num_bins, uniform_fraction=0.5, low_return_fraction=0.4, historical_fraction=0.1, temperature=25.0, max_return=...)` with `sample_reference_states(env_ids) -> (state_dict, bin_ids)`, EMA `update_returns(bin_ids, episode_returns)`, a historical softmax-weight EMA updated on every sample call, and serializable state.

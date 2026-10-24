@@ -206,6 +206,22 @@ def test_amp_rsi_sampler_prefers_separate_dataset_and_keeps_legacy_fallback():
     assert _resolve_rsi_frame_sampler(expert_dataset)(2) == {"source": "rsi", "batch_size": 2}
 
 
+def test_amp_rsi_sampler_uses_dataset_owned_sampler():
+    class Sampler:
+        def sample(self, dataset, batch_size):
+            return type("Batch", (), {"states": {"dataset": dataset, "count": batch_size}})()
+
+    class Dataset:
+        reference_state_sampler = Sampler()
+
+        def sample_reference_state_batch(self, batch_size):
+            return self.reference_state_sampler.sample(self, batch_size)
+
+    dataset = Dataset()
+    sampled = _resolve_rsi_frame_sampler(dataset)(3)
+    assert sampled == {"dataset": dataset, "count": 3}
+
+
 def test_amp_construction_keeps_expert_and_single_frame_rsi_sources_separate(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

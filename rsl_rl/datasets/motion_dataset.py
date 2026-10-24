@@ -7,8 +7,8 @@ import numpy as np
 from .base_motion_dataset import BaseMotionDataset
 
 
-class MotionDataset(BaseMotionDataset):
-    """Load the existing BeyondMimic-compatible NPZ motion contract."""
+class BeyondMimicMotionDataset(BaseMotionDataset):
+    """Load the BeyondMimic NPZ motion format and convert it to the shared contract."""
 
     input_quaternion_format = "wxyz"
 
@@ -21,3 +21,7 @@ class MotionDataset(BaseMotionDataset):
             print(f"[AMP] Skipping {motion_file} (no body_names, required for key_body_names)")
             return None
         return self._tensor_motion(data, self.device, self.input_quaternion_format)
+
+
+# Backward-compatible name used by existing AMP configuration and project code.
+MotionDataset = BeyondMimicMotionDataset

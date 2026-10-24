@@ -8,19 +8,17 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
-
 import torch
 
+from .replay import ReplayBatch, ReplaySampler
+from .replay_samplers import EpisodeSequenceSampler
 
-@dataclass(frozen=True)
-class EpisodeSequenceBatch:
+
+class EpisodeSequenceBatch(ReplayBatch):
     """Contiguous state/action/reward sequences sampled from completed episodes."""
 
-    observations: torch.Tensor
-    actions: torch.Tensor
-    rewards: torch.Tensor
-    terminated: torch.Tensor
+    def __init__(self, observations, actions, rewards, terminated):
+        super().__init__(observations=observations, actions=actions, rewards=rewards, terminated=terminated)
 
 
 class EpisodeReplayBuffer:
@@ -32,6 +30,7 @@ class EpisodeReplayBuffer:
         sequence_length: int,
         batch_size: int,
         device: str | torch.device = "cpu",
+        sampler: ReplaySampler | None = None,
     ) -> None:
         if capacity <= 0 or sequence_length <= 0 or batch_size <= 0:
             raise ValueError("Episode replay capacity, sequence length, and batch size must be positive.")
@@ -39,6 +38,7 @@ class EpisodeReplayBuffer:
         self.sequence_length = int(sequence_length)
         self.batch_size = int(batch_size)
         self.device = torch.device(device)
+        self.sampler = sampler or EpisodeSequenceSampler()
         self._episodes: deque[list[dict[str, torch.Tensor]]] = deque()
         self._current: dict[int, list[dict[str, torch.Tensor]]] = {}
         self._order_queue: deque[tuple[int, int, list[dict[str, torch.Tensor]]]] = deque()
@@ -101,29 +101,8 @@ class EpisodeReplayBuffer:
 
     def sample(self) -> EpisodeSequenceBatch:
         """Sample fixed-length sequences without crossing episode boundaries."""
-        eligible = [episode for episode in self._episodes if len(episode) >= self.sequence_length]
-        if not eligible:
-            raise RuntimeError(
-                f"No completed episode is long enough for sequence length {self.sequence_length}."
-            )
-        observations, actions, rewards, terminated = [], [], [], []
-        for _ in range(self.batch_size):
-            episode = eligible[int(torch.randint(len(eligible), ()).item())]
-            max_start = len(episode) - self.sequence_length
-            start = int(torch.randint(max_start + 1, ()).item())
-            sequence = episode[start : start + self.sequence_length]
-            observations.append(
-                torch.stack([sequence[0]["observation"]] + [transition["next_observation"] for transition in sequence])
-            )
-            actions.append(torch.stack([transition["action"] for transition in sequence]))
-            rewards.append(torch.stack([transition["reward"] for transition in sequence]))
-            terminated.append(torch.stack([transition["terminated"] for transition in sequence]))
-        return EpisodeSequenceBatch(
-            observations=torch.stack(observations),
-            actions=torch.stack(actions),
-            rewards=torch.stack(rewards),
-            terminated=torch.stack(terminated),
-        )
+        batch = self.sampler.sample(self, self.batch_size)
+        return EpisodeSequenceBatch(**batch)
 
     def state_dict(self) -> dict:
         """Serialize completed and in-progress episode data."""

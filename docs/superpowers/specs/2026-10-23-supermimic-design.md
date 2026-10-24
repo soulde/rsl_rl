@@ -1,5 +1,10 @@
 # SuperMimic Design
 
+> Architecture update (2026-10-24): the initial runner-to-task sampler
+> injection proposal below was superseded. `OffPolicyRunner` now only invokes
+> the optional generic algorithm hook `initialize_env(env)`; SuperMimic binds
+> its sampler through the task's public `set_reference_state_sampler()` API.
+
 ## Goal
 
 Add a native SuperMimic-style model-based imitation learning algorithm to `rsl_rl`, with sequence replay, a differentiable state-space world model, an imagined-rollout actor/critic trainer, and an Isaac Lab reference-state reset protocol.
@@ -8,7 +13,7 @@ Add a native SuperMimic-style model-based imitation learning algorithm to `rsl_r
 
 - Add dedicated `SuperMimic`, world model, sequence replay, and return-aware reference sampler implementations. Do not change TD-MPC2 replay or model behavior.
 - Construct the algorithm through the existing `construct_algorithm(obs, env, cfg, device)` path and use `OffPolicyRunner` for vector collection, logging, and checkpoint lifecycle.
-- Keep `VecEnv` required methods unchanged. SuperMimic requires an Isaac Lab task-side reset protocol, following AMP RSI's runner-to-environment sampler injection pattern.
+- Keep `VecEnv` required methods unchanged. SuperMimic requires an Isaac Lab task-side reset protocol, but keeps sampler binding inside the SuperMimic algorithm and the task's explicit public API rather than the generic runner.
 
 ## Replay and model data
 
@@ -27,7 +32,7 @@ Add a native SuperMimic-style model-based imitation learning algorithm to `rsl_r
 ## Isaac Lab reset and domain randomization
 
 - Add a reference-state sampler alongside AMP's uniform RSI sampler. It accepts configurable mixture weights and per-reference-bin return estimates, then samples aligned reset state plus reference-bin ID. Default mixture: `0.5 / num_bins + 0.4 * softmax(-25 * bin_return / max_return) + 0.1 * normalized_historical_softmax_weights`; update historical weights by EMA on sampling and bin returns by EMA on episode completion.
-- The runner injects the sampler into the unwrapped Isaac Lab task, following AMP's `_amp_rsi_sampler` pattern. The task calls it during reset, applies the returned state, and publishes the selected reference-bin ID in observations or step extras.
+- The SuperMimic algorithm binds its sampler through the task's public `set_reference_state_sampler(sampler, joint_layout)` API during `initialize_env(env)`. The task calls it during reset, applies the returned state, and publishes the selected reference-bin ID in observations or step extras. The generic runner only dispatches the optional algorithm lifecycle hook.
 - SuperMimic requires the reference-bin ID contract and does not fall back to ordinary reset. The trainer accumulates episode returns by reset bin and updates sampler statistics.
 - Simulator-specific domain randomization remains in the Isaac Lab task. Context values affecting dynamics are supplied by the task and stored in replay for model conditioning.
 

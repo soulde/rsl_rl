@@ -11,6 +11,7 @@ import torch
 from abc import ABC, abstractmethod
 
 from .amp_features import amp_features_to_heading_frame, amp_features_to_body_frame
+from .reference_sampler import ReferenceStateSampler, UniformReferenceStateSampler
 
 
 class BaseMotionDataset(ABC):
@@ -21,7 +22,6 @@ class BaseMotionDataset(ABC):
     use XYZW; subclasses define the input file order for their dataset format.
     """
 
-    input_quaternion_format = "wxyz"
     reference_joint_pos_field = "joint_pos"
     reference_joint_vel_field = "joint_vel"
 
@@ -145,7 +145,29 @@ class BaseMotionDataset(ABC):
             self._motion_observation_dim = self.transitions.shape[-1] // 2
         else:
             self.transitions = torch.empty((0, 2 * self._motion_observation_dim), device=device)
+        self.reference_state_sampler = UniformReferenceStateSampler()
         print(f"[AMP] Preloaded {len(self.transitions)} expert transitions on {device}")
+
+    def set_reference_state_sampler(self, sampler: ReferenceStateSampler) -> None:
+        if not isinstance(sampler, ReferenceStateSampler):
+            raise TypeError("reference_state_sampler must implement ReferenceStateSampler")
+        self.reference_state_sampler = sampler
+
+    def sample_reference_state_batch(self, batch_size: int):
+        """Sample reference states through the sampler owned by this dataset."""
+        return self.reference_state_sampler.sample(self, batch_size)
+
+    def update_reference_state_sampler(self, bin_ids: torch.Tensor, returns: torch.Tensor) -> None:
+        """Pass completed-episode returns to the dataset's sampling strategy."""
+        self.reference_state_sampler.update_returns(bin_ids, returns)
+
+    def reference_state_sampler_state_dict(self) -> dict:
+        """Return checkpoint state for the currently configured sampling strategy."""
+        return self.reference_state_sampler.state_dict()
+
+    def load_reference_state_sampler_state_dict(self, state: dict) -> None:
+        """Restore checkpoint state into the currently configured sampling strategy."""
+        self.reference_state_sampler.load_state_dict(state)
 
     @staticmethod
     def _select_motion_files(motion_dir, motion_file_pattern, motion_files):
@@ -176,6 +198,8 @@ class BaseMotionDataset(ABC):
 
     @staticmethod
     def _tensor_motion(data, device, quaternion_format):
+        if quaternion_format not in {"wxyz", "xyzw"}:
+            raise ValueError("quaternion_format must be 'wxyz' or 'xyzw'")
         body_quat = torch.tensor(data["body_quat_w"], dtype=torch.float32, device=device)
         body_quat_xyzw = body_quat if quaternion_format == "xyzw" else body_quat[..., [1, 2, 3, 0]]
         motion = {

@@ -8,7 +8,7 @@
 from .cnn import CNN
 from .distribution import BetaDistribution, Distribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 from .mlp import MLP
-from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
+from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization, RunningNorm
 from .rnn import RNN, HiddenState
 from .transformer import CrossAttention, SinusoidalPositionalEncoding
 
@@ -21,6 +21,7 @@ __all__ = [
     "Distribution",
     "EmpiricalDiscountedVariationNormalization",
     "EmpiricalNormalization",
+    "RunningNorm",
     "GaussianDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
