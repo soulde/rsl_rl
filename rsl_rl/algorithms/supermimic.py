@@ -38,6 +38,7 @@ class SuperMimic:
         lr_decay_iters=250000,
         grad_clip_norm=1.0,
         save_replay=False,
+        compile_training=False,
     ):
         if min(horizon, utd, wm_batches, policy_batch_size, critic_epochs, critic_minibatches, lr_decay_iters) <= 0:
             raise ValueError("SuperMimic schedule values must be positive")
@@ -55,6 +56,7 @@ class SuperMimic:
         self.actor_optimizer = torch.optim.Adam(actor.parameters(), lr=lr, betas=(0.9, 0.95))
         self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=lr)
         self.num_steps = 0
+        self.num_collection_steps = 0
         self.num_updates = 0
         self.training = True
         self._transition = None
@@ -63,17 +65,32 @@ class SuperMimic:
         self._episode_returns = None
         self._undiscounted_returns = None
         self._episode_steps = None
+        self._metric_reward_sum = 0.0
+        self._metric_reward_count = 0
+        self._metric_done_count = 0
+        self._metric_terminated_count = 0
+        self._metric_episode_returns = []
+        if compile_training:
+            # Compile differentiable training computations; keep collection,
+            # replay and optimizer bookkeeping eager.
+            self.model.step = torch.compile(self.model.step)
+            self.model.loss = torch.compile(self.model.loss)
+            self.actor.forward = torch.compile(self.actor.forward)
+            for name in ("observation", "reward", "termination", "critic_features"):
+                setattr(self.mdp, name, torch.compile(getattr(self.mdp, name)))
 
     @property
     def warmup_steps_collected(self):
-        """Return replayed vector steps available toward the configured warmup."""
-        return min(self.replay_buffer.size, self.warmup_steps)
+        """Return vectorized simulator steps collected toward the configured warmup."""
+        return min(self.num_collection_steps, self.warmup_steps)
 
     def _extract(self, obs, name):
         return torch.cat([obs[key].to(self.device, dtype=torch.float32) for key in self.obs_groups[name]], -1)
 
     def act(self, obs):
         actor_obs = self._extract(obs, "actor")
+        if self.training and getattr(self.mdp, "collection_observations_clean", False):
+            actor_obs = self.mdp.add_noise(actor_obs)
         goal = self._extract(obs, "goal")
         if "reference_bin_id" not in obs:
             raise ValueError("Missing reference_bin_id")
@@ -88,6 +105,8 @@ class SuperMimic:
             self._episode_steps = torch.zeros(len(actor_obs), device=self.device, dtype=torch.long)
         else:
             self._obs_history = torch.cat((self._obs_history[:, 1:], actor_obs[:, None]), 1)
+        fresh = self._episode_steps == 0
+        self._obs_history[fresh] = actor_obs[fresh, None].expand(-1, self.actor.history_length, -1)
         with torch.no_grad():
             if self.training:
                 self.actor.obs_norm.update(actor_obs)
@@ -122,6 +141,10 @@ class SuperMimic:
         timeouts = extras.get("time_outs", torch.zeros_like(dones)).to(self.device).bool().reshape(-1)
         terminated = extras.get("terminated", dones & ~timeouts).to(self.device).bool().reshape(-1)
         rewards = rewards.to(self.device).reshape(-1)
+        self._metric_reward_sum += float(rewards.detach().sum())
+        self._metric_reward_count += rewards.numel()
+        self._metric_done_count += int(dones.sum())
+        self._metric_terminated_count += int(terminated.sum())
         next_state = self._extract(next_obs, "state")
         transition = self._transition
         self.replay_buffer.add({
@@ -142,6 +165,9 @@ class SuperMimic:
         self._episode_steps += 1
         if dones.any():
             length = self._episode_steps[dones].float()
+            self._metric_episode_returns.extend(
+                (self._undiscounted_returns[dones] / (length * self.mdp.max_step_reward)).detach().cpu().tolist()
+            )
             bootstrap = torch.where(
                 terminated[dones],
                 0.0,
@@ -158,12 +184,32 @@ class SuperMimic:
         self._previous_actions = transition["action"].clone()
         self._previous_actions[dones] = 0
         self.num_steps += len(dones)
+        self.num_collection_steps += 1
         self._transition = None
+
+    def _drain_collection_metrics(self):
+        metrics = {}
+        if self._metric_reward_count:
+            metrics["SuperMimic/sim_reward_normalized"] = (
+                self._metric_reward_sum / self._metric_reward_count / self.mdp.max_step_reward
+            )
+        if self._metric_done_count:
+            metrics["SuperMimic/termination_fraction"] = self._metric_terminated_count / self._metric_done_count
+        if self._metric_episode_returns:
+            metrics["SuperMimic/episode_return_normalized"] = (
+                sum(self._metric_episode_returns) / len(self._metric_episode_returns)
+            )
+        self._metric_reward_sum = 0.0
+        self._metric_reward_count = 0
+        self._metric_done_count = 0
+        self._metric_terminated_count = 0
+        self._metric_episode_returns.clear()
+        return metrics
 
     def _sample_valid_starts(self):
         starts, histories = [], []
         count = 0
-        for _ in range(128):
+        while count < self.policy_batch_size:
             replay_batch = self.replay_buffer.sample_starts(2 * self.policy_batch_size)
             start, history = replay_batch.start, replay_batch.history
             valid = self.mdp.valid_starts(start["reference_motion_id"], start["reference_frame_id"], self.horizon)
@@ -172,12 +218,10 @@ class SuperMimic:
                 starts.append({k: v[ids] for k, v in start.items()})
                 histories.append({k: v[ids] for k, v in history.items()})
                 count += len(ids)
-            if count == self.policy_batch_size:
-                return (
-                    {k: torch.cat([x[k] for x in starts]) for k in starts[0]},
-                    {k: torch.cat([x[k] for x in histories]) for k in histories[0]},
-                )
-        raise RuntimeError("Replay needs valid reference starts with a full imagination horizon")
+        return (
+            {k: torch.cat([x[k] for x in starts]) for k in starts[0]},
+            {k: torch.cat([x[k] for x in histories]) for k in histories[0]},
+        )
 
     def update(self, iteration=None):
         iteration = self.num_updates if iteration is None else iteration
@@ -186,24 +230,24 @@ class SuperMimic:
         for optimizer in (self.model_optimizer, self.actor_optimizer, self.critic_optimizer):
             for group in optimizer.param_groups:
                 group["lr"] = self.learning_rate
+        metrics = self._drain_collection_metrics()
         if self.replay_buffer.size < self.replay_buffer.sequence_length:
-            return {}
+            self.num_updates += 1
+            return metrics
         for _ in range(self.wm_batches):
             loss = self.model.loss(self.replay_buffer.sample_windows())
             self.model_optimizer.zero_grad(set_to_none=True)
             loss["total_loss"].backward()
             nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
             self.model_optimizer.step()
-        metrics = {
-            "model_loss": float(loss["state_loss"].detach()),
-            "last_step_error": float(loss["last_step_error"].detach()),
-        }
+        metrics.update(
+            {
+                "SuperMimic/model_loss": float(loss["state_loss"].detach()),
+                "SuperMimic/last_step_error": float(loss["last_step_error"].detach()),
+            }
+        )
         if iteration >= self.wm_only_iters:
-            try:
-                metrics.update(self._update_imagined_policy())
-            except RuntimeError as error:
-                if "needs valid reference" not in str(error):
-                    raise
+            metrics.update(self._update_imagined_policy())
         self.num_updates += 1
         return metrics
 
@@ -235,6 +279,7 @@ class SuperMimic:
         states, frames, goals, rewards, terminals = [], [], [], [], []
         survival = torch.ones(len(frame), device=self.device)
         objective = torch.zeros_like(survival)
+        undiscounted_surviving_reward = torch.zeros_like(survival)
         try:
             for step in range(self.horizon):
                 action = self.actor(obs_history, goal)
@@ -243,6 +288,7 @@ class SuperMimic:
                 reward = self.mdp.reward(state, ids, frame, action, previous)
                 terminal = self.mdp.termination(state, ids, frame, soft=True)
                 objective = objective + self.gamma**step * survival * reward
+                undiscounted_surviving_reward = undiscounted_surviving_reward + survival * reward
                 survival = survival * (1 - terminal)
                 observation = self.mdp.observation(state, action, context, ids, frame, noisy=True)
                 obs_history = torch.cat((obs_history[:, 1:], observation[:, None]), 1)
@@ -288,19 +334,24 @@ class SuperMimic:
             )
             x = features[:-1].flatten(0, 1)
             y = returns.flatten()
+        minibatch_size = len(x) // self.critic_minibatches
         for _ in range(self.critic_epochs):
-            for idx in torch.tensor_split(torch.randperm(len(x), device=self.device), self.critic_minibatches):
-                if not len(idx):
-                    continue
+            permutation = torch.randperm(len(x), device=self.device)
+            for minibatch in range(self.critic_minibatches):
+                idx = permutation[minibatch * minibatch_size : (minibatch + 1) * minibatch_size]
                 critic_loss = (self.critic(x[idx]) - y[idx]).square().mean()
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_norm)
                 self.critic_optimizer.step()
         return {
-            "actor_loss": float(actor_loss.detach()),
-            "critic_loss": float(critic_loss.detach()),
-            "imagined_survival": float(survival.detach().mean()),
+            "SuperMimic/actor_loss": float(actor_loss.detach()),
+            "SuperMimic/actor_grad_norm": float(norm.detach()),
+            "SuperMimic/critic_loss": float(critic_loss.detach()),
+            "SuperMimic/imagined_reward_normalized": float(
+                (undiscounted_surviving_reward / self.horizon / self.mdp.max_step_reward).mean().detach()
+            ),
+            "SuperMimic/imagined_survival": float(survival.detach().mean()),
         }
 
     @staticmethod
@@ -339,7 +390,8 @@ class SuperMimic:
             len(dataset.reference_bins), max_return=mdp.max_step_reward / (1 - algorithm.get("gamma", 0.99)),
             device=device,
         )
-        dataset.set_reference_state_sampler(sampler)
+        if not isinstance(dataset.reference_state_sampler, ReturnAwareReferenceSampler):
+            dataset.set_reference_state_sampler(sampler)
         replay = SuperMimicReplayBuffer(
             memory.get("capacity", 1000),
             env.num_envs,
@@ -366,7 +418,8 @@ class SuperMimic:
         if not callable(set_sampler) or not callable(reset):
             raise RuntimeError("SuperMimic requires an environment with set_reference_state_sampler() and reset()")
         set_sampler(self.sample_rsi, self.get_rsi_joint_layout())
-        reset()
+        if not getattr(self.mdp, "collection_observations_clean", False):
+            reset()
 
     def get_rsi_joint_layout(self):
         from rsl_rl.datasets.rsi_contract import reference_joint_layout
@@ -392,6 +445,7 @@ class SuperMimic:
         state = {
             "supermimic_version": self.checkpoint_version,
             "num_steps": self.num_steps,
+            "num_collection_steps": self.num_collection_steps,
             "num_updates": self.num_updates,
             "sampler_state_dict": self.dataset.reference_state_sampler_state_dict(),
         }
@@ -423,6 +477,9 @@ class SuperMimic:
         self.dataset.load_reference_state_sampler_state_dict(state["sampler_state_dict"])
         self.num_updates = state["num_updates"]
         self.num_steps = state["num_steps"]
+        # Checkpoints created before collection-step tracking were saved after
+        # the initial warmup, matching the reference trainer's resume behavior.
+        self.num_collection_steps = int(state.get("num_collection_steps", self.warmup_steps))
         self._obs_history = None
         self._transition = None
         return load_cfg.get("iteration", True)

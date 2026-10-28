@@ -61,31 +61,22 @@ class ReturnAwareReferenceSampler(ReferenceStateSampler):
             states = dataset.sample_reference_states_by_bin(bin_ids)
             return states
 
-        selected_frames = []
-        for bin_id in bin_ids.cpu().tolist():
-            frames = reference_bins[bin_id]
-            motions = getattr(dataset, "motions", None)
-            if motions is not None:
-                usable = [
-                    (motion_id, frame_id)
-                    for motion_id, frame_id in frames
-                    if frame_id < len(motions[motion_id]["joint_pos"]) - 1
-                ]
-                frames = usable or frames
-            if not frames:
-                raise RuntimeError(f"RSI reference bin {bin_id} contains no frames")
-            frame_index = int(torch.randint(len(frames), ()).item())
-            selected_frames.append(frames[frame_index])
+        # Match the reference GPU draw, including singleton terminal bins.
+        starts = torch.tensor([frames[0][1] for frames in reference_bins], device=self.device)
+        motion_ids = torch.tensor([frames[0][0] for frames in reference_bins], device=self.device)
+        ends = torch.tensor([frames[-1][1] + 1 for frames in reference_bins], device=self.device)
+        last = torch.tensor([len(m["joint_pos"]) - 1 for m in dataset.motions], device=self.device)
+        selected_motions = motion_ids[bin_ids]
+        start = starts[bin_ids]
+        end = torch.minimum(ends[bin_ids], last[selected_motions])
+        frames = start + (torch.rand(len(bin_ids), device=self.device) * (end - start).float()).long()
+        selected_frames = list(zip(selected_motions.cpu().tolist(), frames.cpu().tolist(), strict=True))
         states = decode(selected_frames)
         with_joint_contract = getattr(dataset, "_with_joint_contract", None)
         if with_joint_contract is not None:
             states = with_joint_contract(states)
-        states["reference_motion_ids"] = torch.tensor(
-            [motion_id for motion_id, _ in selected_frames], dtype=torch.long, device=self.device
-        )
-        states["reference_frame_ids"] = torch.tensor(
-            [frame_id for _, frame_id in selected_frames], dtype=torch.long, device=self.device
-        )
+        states["reference_motion_ids"] = selected_motions
+        states["reference_frame_ids"] = frames
         return states
 
     def update_returns(self, bin_ids: torch.Tensor, episode_returns: torch.Tensor) -> None:
@@ -97,9 +88,11 @@ class ReturnAwareReferenceSampler(ReferenceStateSampler):
             raise ValueError("episode_returns must be finite")
         if (bin_ids < 0).any() or (bin_ids >= self.num_bins).any():
             raise ValueError(f"bin_ids must be in [0, {self.num_bins})")
-        for bin_id in bin_ids.unique():
-            estimate = episode_returns[bin_ids == bin_id].mean()
-            self.return_estimates[bin_id] = 0.8 * self.return_estimates[bin_id] + 0.2 * estimate
+        # Match the reference env's batched index_put_ update, including its
+        # duplicate-bin behavior when several environments finish together.
+        self.return_estimates.index_put_(
+            (bin_ids,), 0.8 * self.return_estimates[bin_ids] + 0.2 * episode_returns
+        )
         self._probabilities = self._build_probabilities()
 
     def state_dict(self) -> dict[str, torch.Tensor | float | int]:
